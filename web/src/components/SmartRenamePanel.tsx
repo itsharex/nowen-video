@@ -81,6 +81,13 @@ export default function SmartRenamePanel({
   const [threshold, setThreshold] = useState(0.7)
   const [scanning, setScanning] = useState(false)
 
+  // 扫描进度（前端模拟）
+  // 后端 /scan 是单次同步请求，没有进度回调；这里用「分段平滑逼近上限 + 阶段提示」
+  // 让用户感知到进度，避免长时间无反馈以为卡死。
+  const [scanProgress, setScanProgress] = useState(0) // 0~100
+  const [scanPhase, setScanPhase] = useState<string>('') // 阶段文案
+  const [scanElapsed, setScanElapsed] = useState(0) // 秒
+
   const [plan, setPlan] = useState<RenamePlan | null>(null)
   const [filter, setFilter] = useState<'all' | 'pending' | 'unsafe' | 'skipped' | 'executed' | 'failed'>('all')
   const [confirmModal, setConfirmModal] = useState(false)
@@ -106,6 +113,34 @@ export default function SmartRenamePanel({
       return
     }
     setScanning(true)
+    setScanProgress(0)
+    setScanPhase('正在连接服务…')
+    setScanElapsed(0)
+
+    // 启动「分段平滑逼近」进度模拟
+    // 阶段划分（启用 AI 时整体上限稍慢，停在 92%；不启用 AI 停在 95%）
+    const startedAt = Date.now()
+    const ceiling = enableAI ? 92 : 95
+    const tickMs = 250
+    const elapsedTimer = window.setInterval(() => {
+      setScanElapsed(Math.floor((Date.now() - startedAt) / 1000))
+    }, 500)
+    const progressTimer = window.setInterval(() => {
+      setScanProgress((p) => {
+        if (p >= ceiling) return p
+        // 平滑逼近：剩余距离的 ~3% 一步，越接近上限越慢
+        const remain = ceiling - p
+        const step = Math.max(0.3, remain * 0.03)
+        const next = Math.min(ceiling, p + step)
+        // 阶段文案根据进度切换
+        if (next < 25) setScanPhase('① 枚举文件…')
+        else if (next < 55) setScanPhase('② 解析命名规则…')
+        else if (next < 80) setScanPhase(enableAI ? '③ 调用 AI Fallback 识别…' : '③ 评分与归一化…')
+        else setScanPhase('④ 生成重命名规划…')
+        return next
+      })
+    }, tickMs)
+
     try {
       const resp = await smartRenameApi.scan({
         root_path: rootPath.trim(),
@@ -113,12 +148,24 @@ export default function SmartRenamePanel({
         enable_ai_fallback: enableAI,
         ai_confidence_threshold: threshold,
       })
+      // 请求成功 → 推到 100%
+      setScanProgress(100)
+      setScanPhase('✓ 扫描完成')
       emitPlan(resp.data.data)
       toast.success(`扫描完成：${resp.data.data.total_items} 个文件，需改名 ${resp.data.data.need_rename}`)
     } catch (e: any) {
+      setScanPhase('✕ 扫描失败')
       toast.error(`扫描失败：${e?.response?.data?.error || e.message || '未知错误'}`)
     } finally {
-      setScanning(false)
+      window.clearInterval(progressTimer)
+      window.clearInterval(elapsedTimer)
+      // 进度条短暂保留，让用户看到 100% 后再隐藏
+      window.setTimeout(() => {
+        setScanning(false)
+        setScanProgress(0)
+        setScanPhase('')
+        setScanElapsed(0)
+      }, 800)
     }
   }
 
@@ -298,6 +345,48 @@ export default function SmartRenamePanel({
               {scanning ? '扫描中…' : '开始扫描'}
             </button>
           </div>
+
+          {/* 扫描进度条：仅在 scanning 时显示 */}
+          {scanning && (
+            <div className="md:col-span-2 mt-2">
+              <div className="mb-1.5 flex items-center justify-between text-xs">
+                <span style={{ color: 'var(--text-secondary)' }}>{scanPhase || '准备中…'}</span>
+                <span style={{ color: 'var(--text-tertiary)' }}>
+                  {scanProgress.toFixed(0)}% · 已用时 {formatElapsed(scanElapsed)}
+                </span>
+              </div>
+              <div
+                className="relative h-2 w-full overflow-hidden rounded-full"
+                style={{ background: 'var(--bg-subtle)', border: '1px solid var(--border-subtle)' }}
+              >
+                {/* 实进度（平滑过渡） */}
+                <div
+                  className="h-full rounded-full transition-all duration-300 ease-out"
+                  style={{
+                    width: `${scanProgress}%`,
+                    background: 'linear-gradient(90deg, var(--neon-blue), var(--neon-purple))',
+                    boxShadow: '0 0 8px var(--neon-blue-40)',
+                  }}
+                />
+                {/* 顶层流光：未到 100% 时附加 indeterminate 闪光，强化「进行中」感知 */}
+                {scanProgress < 100 && (
+                  <div
+                    className="pointer-events-none absolute inset-y-0 w-1/3 rounded-full opacity-60"
+                    style={{
+                      background:
+                        'linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent)',
+                      animation: 'smartRenameShimmer 1.4s linear infinite',
+                    }}
+                  />
+                )}
+              </div>
+              {/* 内联 keyframes（避免污染全局样式表） */}
+              <style>{`@keyframes smartRenameShimmer { 0% { transform: translateX(-100%);} 100% { transform: translateX(400%);} }`}</style>
+              <div className="mt-1.5 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                💡 大目录可能耗时较长（依目录大小与 AI 响应速度而定），请勿关闭本面板
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -484,6 +573,14 @@ export default function SmartRenamePanel({
 }
 
 // ===== 小组件 =====
+
+// 把秒数格式化为 mm:ss
+function formatElapsed(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) sec = 0
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
 
 function Stat({ label, value, accent }: { label: string; value: number; accent?: string }) {
   return (
