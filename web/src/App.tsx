@@ -31,7 +31,6 @@ const BrowsePage = lazy(() => import('@/pages/BrowsePage'))
 const PersonDetailPage = lazy(() => import('@/pages/PersonDetailPage'))
 const CollectionsPage = lazy(() => import('@/pages/CollectionsPage'))
 const CollectionDetailPage = lazy(() => import('@/pages/CollectionDetailPage'))
-const SmartRenamePage = lazy(() => import('@/pages/SmartRenamePage'))
 
 // 页面加载中的占位组件 — 品牌化霓虹脉冲环
 function PageLoader() {
@@ -155,7 +154,8 @@ export default function App() {
               <Route path="collections" element={<CollectionsPage />} />
               <Route path="collections/:id" element={<CollectionDetailPage />} />
               <Route path="person/:id" element={<PersonDetailPage />} />
-              <Route path="smart-rename" element={<SmartRenamePage />} />
+              {/* 智能重命名入口已收敛到媒体库 → 扫描归类专家模式（方案 B：UI 收敛） */}
+              <Route path="smart-rename" element={<Navigate to="/admin" replace />} />
             </Route>
 
             {/* 未匹配路由 */}

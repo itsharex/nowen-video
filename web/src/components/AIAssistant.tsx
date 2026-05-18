@@ -219,7 +219,6 @@ export default function AIAssistant({ selectedMediaIds, libraryId, onOperationCo
   // 快捷指令
   const quickCommands = [
     { label: '📊 分析文件库', cmd: '分析当前文件库的整体状态，给出优化建议' },
-    { label: '✨ 智能重命名', cmd: '帮我把选中的文件按照规范格式重命名' },
     { label: '🔍 批量刮削', cmd: '为选中的文件批量获取元数据' },
     { label: '🏷️ 自动分类', cmd: '分析选中文件的内容，自动添加合适的标签分类' },
     { label: '🔧 检测问题', cmd: '检查选中文件是否有命名不规范、信息缺失等问题' },
