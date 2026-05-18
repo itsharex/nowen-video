@@ -93,7 +93,7 @@ export default function AIDispatcherPanel({ onConfigChanged }: AIDispatcherPanel
   const handleSwitch = async (provider: string) => {
     const ok = await dialog.confirm({
       title: '切换 AI Provider',
-      content: `确定要将所有 AI 调用切换到 ${provider} 吗？\n后续 LLM 请求会立即走 ${provider}，可在"恢复主 provider"按钮一键还原。`,
+      message: `确定要将所有 AI 调用切换到 ${provider} 吗？\n后续 LLM 请求会立即走 ${provider}，可在"恢复主 provider"按钮一键还原。`,
       confirmText: '切换',
       variant: 'primary',
     })
@@ -114,7 +114,7 @@ export default function AIDispatcherPanel({ onConfigChanged }: AIDispatcherPanel
   const handleRestore = async () => {
     const ok = await dialog.confirm({
       title: '恢复主 Provider',
-      content: '确定要恢复到主 provider 吗？',
+      message: '确定要恢复到主 provider 吗？',
       confirmText: '恢复',
       variant: 'primary',
     })

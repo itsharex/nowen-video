@@ -35,7 +35,7 @@ export const aiApi = {
     max_concurrent: number
     request_interval_ms: number
     // 各 provider 配置档案（仅传需要更新的 provider；api_key 留空字符串则保留原值）
-    profiles: Record<string, { api_base?: string; api_key?: string; model?: string }>
+    profiles: Record<string, { api_base?: string; api_key?: string; model?: string; model_chain?: string[] }>
   }>) =>
     api.put<{ message: string; data: AIStatus }>('/admin/ai/config', updates),
 

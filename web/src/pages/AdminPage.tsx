@@ -629,7 +629,7 @@ export default function AdminPage() {
           title: '手动粘贴豆瓣 Cookie',
           message: '无法自动读取剪贴板，请在下方手动粘贴豆瓣 Cookie：',
           placeholder: '粘贴完整 Cookie 字符串',
-          multiline: true,
+          inputType: 'textarea',
         })
         cookie = (input || '').trim()
       }
