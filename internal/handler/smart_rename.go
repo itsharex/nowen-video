@@ -121,7 +121,8 @@ func (h *SmartRenameHandler) Cancel(c *gin.Context) {
 func (h *SmartRenameHandler) ListPlans(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
-	plans, total, err := h.svc.ListPlans(page, size)
+	libraryID := c.Query("library_id")
+	plans, total, err := h.svc.ListPlans(page, size, libraryID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

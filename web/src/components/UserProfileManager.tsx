@@ -6,8 +6,10 @@ import {
   Clock, BarChart3, Loader2, X, Lock,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 export default function UserProfileManager() {
+  const dialog = useDialog()
   const [profiles, setProfiles] = useState<UserProfile[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
@@ -27,7 +29,13 @@ export default function UserProfileManager() {
   useEffect(() => { loadProfiles() }, [])
 
   const handleDelete = async (id: string) => {
-    if (!confirm('确定要删除此配置文件吗？')) return
+    const ok = await dialog.confirm({
+      title: '删除配置文件',
+      message: '确定要删除此配置文件吗？',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await userProfileApi.delete(id)
       setMessage({ type: 'success', text: '配置文件已删除' })
@@ -41,8 +49,14 @@ export default function UserProfileManager() {
   const handleSwitch = async (profile: UserProfile) => {
     let pin: string | undefined
     if (profile.pin) {
-      pin = prompt('请输入 PIN 码') || undefined
-      if (!pin) return
+      const result = await dialog.prompt({
+        title: '请输入 PIN 码',
+        message: `切换到 ${profile.name} 需要 PIN 验证`,
+        placeholder: 'PIN 码',
+        inputType: 'password',
+      })
+      if (!result) return
+      pin = result
     }
     try {
       await userProfileApi.switch(profile.id, pin)

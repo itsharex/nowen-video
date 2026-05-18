@@ -836,6 +836,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&RenameJournal{},
 		// 扫描后处理：虚拟归类与命名映射（仅 DB 层，不动磁盘）
 		&MediaClassification{},
+		// 懒人入库（Lazy Ingest）任务
+		&IngestJob{},
 	); err != nil {
 		return err
 	}

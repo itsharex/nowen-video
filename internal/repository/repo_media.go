@@ -35,6 +35,44 @@ func (r *MediaRepo) FindByFilePath(filePath string) (*model.Media, error) {
 	return &media, err
 }
 
+// ListByFilePaths 批量按 file_path IN (...) 加载。
+//
+// 用途：SmartRename / LazyIngest 等场景需要一次性把"路径→Media"映射拉齐，
+// 避免在循环内逐条 SQL（N+1）。空切片会直接返回空 map，不会发起查询。
+//
+// 注意：分批限制 GORM/SQLite 的 IN 子句参数数量上限（默认 999），故每批 800。
+func (r *MediaRepo) ListByFilePaths(filePaths []string) (map[string]*model.Media, error) {
+	out := make(map[string]*model.Media, len(filePaths))
+	if len(filePaths) == 0 {
+		return out, nil
+	}
+	const batch = 800
+	for i := 0; i < len(filePaths); i += batch {
+		end := i + batch
+		if end > len(filePaths) {
+			end = len(filePaths)
+		}
+		var rows []model.Media
+		if err := r.db.Where("file_path IN ?", filePaths[i:end]).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		for j := range rows {
+			m := rows[j]
+			out[m.FilePath] = &m
+		}
+	}
+	return out, nil
+}
+
+// excludeDuplicates 在前端列表查询里统一过滤掉"同片副本"，
+// 仅保留主版本（duplicate_of 为空）。这是"同片多版本折叠"的核心约束。
+//
+// 注意：仅用于面向用户的列表/海报墙；管理后台、版本切换、扫描器、清理工具
+// 等需要看到全部记录的场景请直接走 r.db。
+func (r *MediaRepo) excludeDuplicates(query *gorm.DB) *gorm.DB {
+	return query.Where("duplicate_of IS NULL OR duplicate_of = ''")
+}
+
 func (r *MediaRepo) List(page, size int, libraryID string) ([]model.Media, int64, error) {
 	var media []model.Media
 	var total int64
@@ -43,6 +81,7 @@ func (r *MediaRepo) List(page, size int, libraryID string) ([]model.Media, int64
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
+	query = r.excludeDuplicates(query)
 
 	query.Count(&total)
 	err := query.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&media).Error
@@ -51,7 +90,8 @@ func (r *MediaRepo) List(page, size int, libraryID string) ([]model.Media, int64
 
 func (r *MediaRepo) Recent(limit int) ([]model.Media, error) {
 	var media []model.Media
-	err := r.db.Order("created_at DESC").Limit(limit).Find(&media).Error
+	err := r.excludeDuplicates(r.db.Model(&model.Media{})).
+		Order("created_at DESC").Limit(limit).Find(&media).Error
 	return media, err
 }
 
@@ -64,6 +104,7 @@ func (r *MediaRepo) Search(keyword string, page, size int) ([]model.Media, int64
 		"title LIKE ? OR orig_title LIKE ? OR genres LIKE ?",
 		"%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%",
 	)
+	query = r.excludeDuplicates(query)
 	query.Count(&total)
 	// 优先显示标题精确匹配的结果，然后按评分降序
 	err := query.Order(
@@ -123,6 +164,7 @@ func (r *MediaRepo) SearchAdvanced(params SearchAdvancedParams) ([]model.Media, 
 	if params.MinRating > 0 {
 		query = query.Where("rating >= ?", params.MinRating)
 	}
+	query = r.excludeDuplicates(query)
 
 	query.Count(&total)
 
@@ -224,6 +266,53 @@ func (r *MediaRepo) ListByLibraryID(libraryID string) ([]model.Media, error) {
 	return media, err
 }
 
+// ListVersionsForMedia 返回与指定 media 同属一个"同片副本组"的全部版本（含主版本本身），
+// 用于前端"切换版本/选择清晰度"UI。
+//
+// 匹配规则（按优先级回退）：
+//  1. 给定 media 是主版本（duplicate_of 为空）：返回 duplicate_of = media.ID 的所有副本 + media 本身
+//  2. 给定 media 是副本（duplicate_of 非空）：返回主版本 + 同主版本下的全部副本
+//  3. 没有 duplicate 关系但有 duplicate_group：按 duplicate_group 聚合
+//  4. 都没有：仅返回 media 自己
+//
+// 排序：分辨率优先级 > 文件大小（高在前），方便前端默认选最高质量。
+func (r *MediaRepo) ListVersionsForMedia(media *model.Media) ([]model.Media, error) {
+	if media == nil || media.ID == "" {
+		return nil, nil
+	}
+
+	primaryID := media.ID
+	if media.DuplicateOf != "" {
+		primaryID = media.DuplicateOf
+	}
+
+	var versions []model.Media
+
+	// 主版本 + 同组副本一次查出
+	// 用 OR 聚合：自己（主或副本回查主） + 所有以 primaryID 为主的副本
+	if err := r.db.Where("id = ? OR duplicate_of = ?", primaryID, primaryID).
+		Order("CASE resolution WHEN '4K' THEN 5 WHEN '2K' THEN 4 WHEN '1080p' THEN 3 WHEN '720p' THEN 2 WHEN '480p' THEN 1 ELSE 0 END DESC, file_size DESC").
+		Find(&versions).Error; err != nil {
+		return nil, err
+	}
+
+	// 兜底：以 duplicate_group 再聚合一次（处理历史脏数据：duplicate_of 为空但 duplicate_group 一致）
+	if len(versions) <= 1 && media.DuplicateGroup != "" {
+		var byGroup []model.Media
+		if err := r.db.Where("duplicate_group = ?", media.DuplicateGroup).
+			Order("CASE resolution WHEN '4K' THEN 5 WHEN '2K' THEN 4 WHEN '1080p' THEN 3 WHEN '720p' THEN 2 WHEN '480p' THEN 1 ELSE 0 END DESC, file_size DESC").
+			Find(&byGroup).Error; err == nil && len(byGroup) > len(versions) {
+			versions = byGroup
+		}
+	}
+
+	if len(versions) == 0 {
+		// 至少返回自己
+		versions = append(versions, *media)
+	}
+	return versions, nil
+}
+
 func (r *MediaRepo) ListBySeriesID(seriesID string) ([]model.Media, error) {
 	var media []model.Media
 	err := r.db.Where("series_id = ?", seriesID).
@@ -240,8 +329,9 @@ func (r *MediaRepo) ListBySeriesAndSeason(seriesID string, seasonNum int) ([]mod
 
 func (r *MediaRepo) RecentNonEpisode(limit int) ([]model.Media, error) {
 	var media []model.Media
-	err := r.db.Where("(series_id = '' OR series_id IS NULL) AND library_id != ''").
-		Order("created_at DESC").Limit(limit).Find(&media).Error
+	query := r.db.Where("(series_id = '' OR series_id IS NULL) AND library_id != ''")
+	query = r.excludeDuplicates(query)
+	err := query.Order("created_at DESC").Limit(limit).Find(&media).Error
 	return media, err
 }
 
@@ -251,6 +341,7 @@ func (r *MediaRepo) RecentNonEpisodeAll(libraryID string) ([]model.Media, error)
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
+	query = r.excludeDuplicates(query)
 	err := query.Order("created_at DESC").Find(&media).Error
 	return media, err
 }
@@ -263,6 +354,7 @@ func (r *MediaRepo) ListNonEpisode(page, size int, libraryID string) ([]model.Me
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
+	query = r.excludeDuplicates(query)
 
 	query.Count(&total)
 	err := query.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&media).Error
@@ -280,6 +372,7 @@ func (r *MediaRepo) CountNonEpisodeByLibrary(libraryID string) (int64, error) {
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
+	query = r.excludeDuplicates(query)
 	err := query.Count(&count).Error
 	return count, err
 }
@@ -290,6 +383,7 @@ func (r *MediaRepo) CountNonEpisode(libraryID string) (int64, error) {
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
+	query = r.excludeDuplicates(query)
 	err := query.Count(&count).Error
 	return count, err
 }

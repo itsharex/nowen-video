@@ -6,8 +6,10 @@ import {
   HardDrive, Loader2, Activity, Globe, Clock, X,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 export default function FederationManager() {
+  const dialog = useDialog()
   const [nodes, setNodes] = useState<ServerNode[]>([])
   const [stats, setStats] = useState<FederationStats | null>(null)
   const [syncTasks, setSyncTasks] = useState<SyncTask[]>([])
@@ -39,7 +41,13 @@ export default function FederationManager() {
   }, [])
 
   const handleRemoveNode = async (id: string) => {
-    if (!confirm('确定要移除此节点吗？')) return
+    const ok = await dialog.confirm({
+      title: '移除联邦节点',
+      message: '确定要移除此节点吗？',
+      confirmText: '移除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await federationApi.removeNode(id)
       setMessage({ type: 'success', text: '节点已移除' })

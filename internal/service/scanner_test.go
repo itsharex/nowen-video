@@ -283,6 +283,31 @@ func TestExtractTitleEnhanced(t *testing.T) {
 			wantYear:  0,
 			desc:      "多个编码标记应全部清理",
 		},
+		// ===== 子标题保留（防止"蜡笔小新：XXX" 被截成"蜡笔小新"，导致全部命中同一 TMDb 条目）=====
+		{
+			filename:  "蜡笔小新：灼热的春日部舞者.2025.mkv",
+			wantTitle: "蜡笔小新: 灼热的春日部舞者",
+			wantYear:  2025,
+			desc:      "蜡笔小新+冒号子标题（必须保留子标题，否则会全部刮成同一部）",
+		},
+		{
+			filename:  "蜡笔小新：云黑斋的野心 (1995).mkv",
+			wantTitle: "蜡笔小新: 云黑斋的野心",
+			wantYear:  1995,
+			desc:      "蜡笔小新剧场版1995（早期作品，子标题必须保留）",
+		},
+		{
+			filename:  "哈利·波特与魔法石 (2001).mkv",
+			wantTitle: "哈利·波特与魔法石",
+			wantYear:  2001,
+			desc:      "中点·分隔的人名标题应整体保留",
+		},
+		{
+			filename:  "你的名字 Your Name 2016.mkv",
+			wantTitle: "你的名字",
+			wantYear:  2016,
+			desc:      "中英并列：取中文为主标题，英文进 TitleAlt",
+		},
 	}
 
 	for _, tt := range tests {

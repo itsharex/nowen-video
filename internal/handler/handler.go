@@ -62,6 +62,10 @@ type Handlers struct {
 	SmartRename *SmartRenameHandler
 	// 扫描后处理：虚拟归类与命名映射（仅 DB 层）
 	ScanPostProcess *ScanPostProcessHandler
+	// 懒人入库（一键入库）
+	LazyIngest *LazyIngestHandler
+	// AI 成本：模型列表 / 估价 / 累计花费
+	AICost *AICostHandler
 }
 
 func NewHandlers(services *service.Services, repos *repository.Repositories, cfg *config.Config, logger *zap.SugaredLogger) *Handlers {
@@ -136,6 +140,10 @@ func NewHandlers(services *service.Services, repos *repository.Repositories, cfg
 		SmartRename: NewSmartRenameHandler(services.SmartRename, logger),
 		// 扫描后处理：虚拟归类与命名映射（仅 DB 层）
 		ScanPostProcess: NewScanPostProcessHandler(services.ScanPostProcess, repos.ScanClassification, logger),
+		// 懒人入库（一键入库）
+		LazyIngest: NewLazyIngestHandler(services.LazyIngest, logger),
+		// AI 成本：模型列表 / 估价 / 累计花费
+		AICost: NewAICostHandler(services.AICost, logger),
 	}
 
 	// P3~P5：注入番号刮削扩展服务

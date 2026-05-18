@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import type { ScrapeTask, ScrapeStatistics, ScrapeHistory } from '@/types'
 import { scrapeApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { usePagination } from '@/hooks/usePagination'
 import Pagination from '@/components/Pagination'
@@ -72,6 +73,7 @@ interface ScrapeManagerPageProps {
 
 export default function ScrapeManagerPage({ embedded = false }: ScrapeManagerPageProps) {
   const toast = useToast()
+  const dialog = useDialog()
   const { on, off } = useWebSocket()
 
   // 数据状态
@@ -263,7 +265,13 @@ export default function ScrapeManagerPage({ embedded = false }: ScrapeManagerPag
 
   // ==================== 删除操作 ====================
   const handleDelete = async (id: string) => {
-    if (!confirm('确定删除该刮削任务？')) return
+    const ok = await dialog.confirm({
+      title: '删除刮削任务',
+      message: '确定删除该刮削任务？',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await scrapeApi.deleteTask(id)
       toast.success('已删除')
@@ -276,7 +284,13 @@ export default function ScrapeManagerPage({ embedded = false }: ScrapeManagerPag
 
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) return
-    if (!confirm(`确定删除选中的 ${selectedIds.size} 个任务？`)) return
+    const ok = await dialog.confirm({
+      title: '批量删除刮削任务',
+      message: `确定删除选中的 ${selectedIds.size} 个任务？`,
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await scrapeApi.batchDeleteTasks(Array.from(selectedIds))
       toast.success('批量删除完成')

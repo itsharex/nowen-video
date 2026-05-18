@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { commentApi } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { useTranslation } from '@/i18n'
 import type { Comment } from '@/types'
 import { MessageSquare, Star, Send, Trash2 } from 'lucide-react'
@@ -23,6 +24,7 @@ export default function CommentSection({ mediaId }: CommentSectionProps) {
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const toast = useToast()
+  const dialog = useDialog()
 
   useEffect(() => {
     loadComments()
@@ -59,7 +61,13 @@ export default function CommentSection({ mediaId }: CommentSectionProps) {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm(t('comment.deleteConfirm'))) return
+    const ok = await dialog.confirm({
+      title: t('comment.deleteConfirm'),
+      confirmText: t('common.delete') ?? '删除',
+      cancelText: t('common.cancel') ?? '取消',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await commentApi.delete(id)
       loadComments()

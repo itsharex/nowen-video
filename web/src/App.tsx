@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { lazy, Suspense } from 'react'
 import { useAuthStore } from '@/stores/auth'
 import { ToastProvider } from '@/components/Toast'
+import { DialogProvider } from '@/components/Dialog'
 import { Toaster } from 'react-hot-toast'
 import Layout from '@/components/Layout'
 import TitleBar from '@/components/TitleBar'
@@ -95,6 +96,7 @@ function ForceChangePasswordRoute() {
 export default function App() {
   return (
     <ToastProvider>
+      <DialogProvider>
       <Toaster position="top-right" />
       <BrowserRouter>
         {/* 桌面端：首次启动"服务器地址"引导（仅在默认端口探活失败时出现） */}
@@ -163,6 +165,7 @@ export default function App() {
           </div>
         </div>
       </BrowserRouter>
+      </DialogProvider>
     </ToastProvider>
   )
 }

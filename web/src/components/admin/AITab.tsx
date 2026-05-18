@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { aiApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { useTranslation } from '@/i18n'
 import type { AIStatus, AIErrorLog, AICacheStats, AITestResult } from '@/types'
 import {
@@ -87,6 +88,7 @@ const RECOMMEND_TEST_CASES = [
 
 export default function AITab() {
   const toast = useToast()
+  const dialog = useDialog()
   const { t } = useTranslation()
 
   // ==================== 状态 ====================
@@ -297,7 +299,13 @@ export default function AITab() {
 
   // ==================== 缓存管理 ====================
   const handleClearCache = async () => {
-    if (!confirm('确定清空所有 AI 缓存？清空后下次请求将重新调用 AI API。')) return
+    const ok = await dialog.confirm({
+      title: '清空 AI 缓存',
+      message: '确定清空所有 AI 缓存？清空后下次请求将重新调用 AI API。',
+      confirmText: '清空',
+      variant: 'warning',
+    })
+    if (!ok) return
     setClearingCache(true)
     try {
       const res = await aiApi.clearCache()

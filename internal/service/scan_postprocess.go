@@ -87,9 +87,9 @@ type ScanPostProcessService struct {
 
 	// 异步队列
 	queue   chan string // 仅传 mediaID
-	once    sync.Once
 	stopCh  chan struct{}
-	running bool
+	started bool // 避免重复启动 worker；Stop 后重建 stopCh 可重启
+	workWG  sync.WaitGroup
 	mu      sync.Mutex
 }
 
@@ -126,32 +126,47 @@ func NewScanPostProcessService(
 	}
 }
 
-// Start 启动后台 worker（幂等）
+// Start 启动后台 worker（幂等）。
+// 之前使用 sync.Once 限制为「进程内仅能启动一次」，Stop 后无法重启。
+// 现改为 started 标志位 + 重建 stopCh，支持「Stop -> Start」循环（如热重载场景）。
 func (s *ScanPostProcessService) Start() {
-	s.once.Do(func() {
-		s.mu.Lock()
-		s.running = true
-		s.mu.Unlock()
-		for i := 0; i < s.cfg.Workers; i++ {
-			go s.worker(i)
-		}
-		s.logger.Infof("[ScanPostProcess] 后台 worker 已启动 workers=%d queue=%d", s.cfg.Workers, s.cfg.QueueSize)
-	})
-}
-
-// Stop 停止后台 worker
-func (s *ScanPostProcessService) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.running {
+	if s.started {
 		return
 	}
-	s.running = false
+	// 重建可能被 Stop 关闭过的 stopCh，避免 worker 启动后立即退出
+	select {
+	case <-s.stopCh:
+		s.stopCh = make(chan struct{})
+	default:
+	}
+	s.started = true
+	for i := 0; i < s.cfg.Workers; i++ {
+		s.workWG.Add(1)
+		go s.worker(i)
+	}
+	s.logger.Infof("[ScanPostProcess] 后台 worker 已启动 workers=%d queue=%d", s.cfg.Workers, s.cfg.QueueSize)
+}
+
+// Stop 同步停止后台 worker：广播 close(stopCh) 后等待所有 worker 退出。
+// 调用后不会丢业已取出但未处理完的任务。
+func (s *ScanPostProcessService) Stop() {
+	s.mu.Lock()
+	if !s.started {
+		s.mu.Unlock()
+		return
+	}
+	s.started = false
 	close(s.stopCh)
+	s.mu.Unlock()
+	s.workWG.Wait()
+	s.logger.Infof("[ScanPostProcess] 后台 worker 已全部退出")
 }
 
 // worker 队列消费协程
 func (s *ScanPostProcessService) worker(idx int) {
+	defer s.workWG.Done()
 	for {
 		select {
 		case <-s.stopCh:

@@ -84,10 +84,10 @@ func (h *ScanPostProcessHandler) Get(c *gin.Context) {
 
 // Reprocess POST /api/admin/scan-classify/reprocess
 //
+// 优先级：当同时提供 media_ids 与 library_id 时，**仅以 media_ids 为准**（同步批量重跑）。
 // 三种用法：
-//  1. 仅 library_id：整库重跑
-//  2. 仅 media_ids：指定条目同步重跑
-//  3. 同时给：先清空整库，再重跑指定条目（少见）
+//  1. 仅 library_id：整库重跑（默认异步入队）
+//  2. 提供 media_ids：指定条目同步重跑（library_id 即使存在也会被忽略）
 func (h *ScanPostProcessHandler) Reprocess(c *gin.Context) {
 	var req reprocessRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

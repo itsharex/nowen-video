@@ -27,6 +27,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 // ==================== 扫描后处理 · 虚拟归类与命名映射 ====================
 //
@@ -73,6 +74,7 @@ const REGION_OPTIONS = [
 ]
 
 export default function ClassificationTab() {
+  const dialog = useDialog()
   // ---------- 状态 ----------
   const [libraries, setLibraries] = useState<Library[]>([])
   const [libraryID, setLibraryID] = useState<string>('')
@@ -160,7 +162,13 @@ export default function ClassificationTab() {
   // ---------- 操作 ----------
   const handleClear = async () => {
     const label = libraryID ? '当前筛选的媒体库' : '全部'
-    if (!confirm(`确定清空 ${label} 的分类记录吗？此操作不可恢复。`)) return
+    const ok = await dialog.confirm({
+      title: '清空分类记录',
+      message: `确定清空 ${label} 的分类记录吗？此操作不可恢复。`,
+      confirmText: '清空',
+      variant: 'danger',
+    })
+    if (!ok) return
     setClearing(true)
     setMessage(null)
     try {

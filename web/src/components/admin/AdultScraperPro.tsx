@@ -38,6 +38,7 @@ import {
   Cookie,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 type Tab = 'batch' | 'folder' | 'cookies' | 'mirrors' | 'cache' | 'scheduler' | 'report'
 
@@ -95,6 +96,7 @@ function TabButton({
 // ==================== 批量刮削面板 ====================
 
 function BatchPanel() {
+  const dialog = useDialog()
   const [tasks, setTasks] = useState<AdultBatchTask[]>([])
   const [history, setHistory] = useState<AdultBatchTask[]>([])
   const [loading, setLoading] = useState(false)
@@ -151,7 +153,7 @@ function BatchPanel() {
       await adultScraperApi.startBatch(opts)
       await loadTasks()
     } catch (err: any) {
-      alert('启动失败: ' + (err?.response?.data?.error || err?.message))
+      await dialog.alert({ title: '启动失败', message: err?.response?.data?.error || err?.message, variant: 'error' })
     } finally {
       setStarting(false)
     }
@@ -390,6 +392,7 @@ function MirrorsPanel() {
 // ==================== 缓存管理面板 ====================
 
 function CachePanel() {
+  const dialog = useDialog()
   const [stats, setStats] = useState<{ size: number; max_size: number; total_hit: number; ttl: string } | null>(null)
   const [loading, setLoading] = useState(false)
 
@@ -408,7 +411,13 @@ function CachePanel() {
   }, [load])
 
   const handleClear = async () => {
-    if (!confirm('确定清空所有番号元数据缓存？')) return
+    const ok = await dialog.confirm({
+      title: '清空番号缓存',
+      message: '确定清空所有番号元数据缓存？',
+      confirmText: '清空',
+      variant: 'danger',
+    })
+    if (!ok) return
     await adultScraperApi.clearCache()
     await load()
   }
@@ -447,6 +456,7 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
 // ==================== 定时调度面板 ====================
 
 function SchedulerPanel() {
+  const dialog = useDialog()
   const [cfg, setCfg] = useState<AdultSchedulerConfig>({
     Enabled: false,
     DailyHour: 3,
@@ -475,7 +485,7 @@ function SchedulerPanel() {
     setSaving(true)
     try {
       await adultScraperApi.updateScheduler(cfg)
-      alert('调度器配置已保存')
+      await dialog.alert({ title: '调度器配置已保存', variant: 'success' })
     } finally {
       setSaving(false)
     }
@@ -485,10 +495,10 @@ function SchedulerPanel() {
     setRunning(true)
     try {
       const res = await adultScraperApi.triggerScheduler()
-      alert('任务已启动：' + res.data.data.task_id)
+      await dialog.alert({ title: '任务已启动', message: res.data.data.task_id, variant: 'success' })
       await load()
     } catch (e: any) {
-      alert(e?.response?.data?.error || e?.message)
+      await dialog.alert({ title: '启动失败', message: e?.response?.data?.error || e?.message, variant: 'error' })
     } finally {
       setRunning(false)
     }
@@ -527,6 +537,7 @@ function SchedulerPanel() {
 // ==================== 分析报表面板 ====================
 
 function ReportPanel() {
+  const dialog = useDialog()
   const [days, setDays] = useState(7)
   const [report, setReport] = useState<AdultScrapeReport | null>(null)
   const [loading, setLoading] = useState(false)
@@ -554,13 +565,23 @@ function ReportPanel() {
   useEffect(() => { load() }, [load])
 
   const handleRetry = async () => {
-    if (!confirm(`确定重试最近 ${days} 天内的 ${failedCount} 条失败记录？`)) return
+    const ok = await dialog.confirm({
+      title: '重试失败记录',
+      message: `确定重试最近 ${days} 天内的 ${failedCount} 条失败记录？`,
+      confirmText: '重试',
+      variant: 'warning',
+    })
+    if (!ok) return
     setRetrying(true)
     try {
       const res = await adultScraperApi.retryFailed({ days, concurrency: 2 })
-      alert(`已启动重试任务: ${res.data.data.task_id}（${res.data.data.retry_count} 条）`)
+      await dialog.alert({
+        title: '重试任务已启动',
+        message: `task_id: ${res.data.data.task_id}（${res.data.data.retry_count} 条）`,
+        variant: 'success',
+      })
     } catch (e: any) {
-      alert(e?.response?.data?.error || e?.message)
+      await dialog.alert({ title: '重试失败', message: e?.response?.data?.error || e?.message, variant: 'error' })
     } finally {
       setRetrying(false)
     }

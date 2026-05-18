@@ -60,6 +60,21 @@ func (h *MediaHandler) Detail(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": media})
 }
 
+// Versions 获取同片多版本列表（供前端版本切换 UI 使用）
+// GET /api/media/:id/versions
+func (h *MediaHandler) Versions(c *gin.Context) {
+	id := c.Param("id")
+	versions, err := h.mediaService.GetVersions(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "媒体不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":  versions,
+		"total": len(versions),
+	})
+}
+
 // DetailEnhanced 获取增强的媒体详情（包含技术规格、媒体库信息、播放统计）
 func (h *MediaHandler) DetailEnhanced(c *gin.Context) {
 	id := c.Param("id")

@@ -71,6 +71,16 @@ func (s *MediaService) GetDetail(id string) (*model.Media, error) {
 	return media, nil
 }
 
+// GetVersions 返回与指定媒体同属一组"同片多版本"的全部副本（含主版本），
+// 供前端"版本切换"UI 使用。返回的版本默认按分辨率/文件大小降序排序。
+func (s *MediaService) GetVersions(id string) ([]model.Media, error) {
+	media, err := s.mediaRepo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	return s.mediaRepo.ListVersionsForMedia(media)
+}
+
 // Recent 最近添加
 func (s *MediaService) Recent(limit int) ([]model.Media, error) {
 	if limit <= 0 || limit > 50 {

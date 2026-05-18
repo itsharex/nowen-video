@@ -81,12 +81,24 @@ var extrasSuffixes = []string{
 // xiaoyaCategoryDirs 已知的"分类目录"名（需要穿透递归，向下一层找真正的剧集/电影目录）
 // key 使用原样（含中文）的目录名；比较时会忽略大小写
 var xiaoyaCategoryDirs = map[string]bool{
+	// 中文分类
 	"电视剧": true, "电影": true, "动漫": true, "短剧": true,
 	"纪录片": true, "纪录片（已刮削）": true, "纪录片(已刮削)": true,
 	"综艺": true, "演唱会": true, "音乐": true, "每日更新": true,
 	// xiaoya 常见的"来源分组"目录
 	"115": true, "115盘": true, "阿里云盘": true, "夸克": true, "夸克网盘": true,
 	"每日更新夸克": true, "xiaoya": true, "小雅": true,
+	// Jellyfin / Emby / Plex 标准英文分类目录（必须支持，否则会把整库误判为单部剧集）
+	"movies": true, "movie": true, "films": true, "film": true,
+	"tv": true, "tv shows": true, "tvshows": true, "shows": true, "tv-shows": true, "tv_shows": true,
+	"series": true, "tvseries": true, "tv series": true,
+	"anime": true, "animation": true, "cartoons": true,
+	"documentaries": true, "documentary": true, "docs": true,
+	"music videos": true, "musicvideos": true, "concerts": true,
+	"kids": true, "children": true, "family": true,
+	// 常见整理后的暂存目录（不应被识别为剧集名）
+	"_unsorted": true, "unsorted": true, "untagged": true, "incoming": true, "inbox": true,
+	"_organized": true, "organized": true,
 }
 
 // xiaoyaNonTVCategoryDirs 在"电视剧扫描"场景下需要整体忽略的分类目录
@@ -134,6 +146,82 @@ func isXiaoyaSkipDir(name string) bool {
 	}
 	// 简单兜底：目录名以 "画质演示" 开头的一律跳过
 	if strings.HasPrefix(strings.TrimSpace(name), "画质演示") {
+		return true
+	}
+	return false
+}
+
+// seasonOnlyDirRe 用来识别纯季号目录名（这种目录名不能作为系列标题）
+//
+//	匹配示例："Season 01", "Season1", "S01", "S1", "第一季", "第02季", "第 2 季", "第二部"
+var seasonOnlyDirRe = regexp.MustCompile(`(?i)^\s*(?:season\s*\d{1,2}|s\d{1,2}|第\s*[一二三四五六七八九十\d]+\s*[季部])\s*$`)
+
+// isSeasonOnlyDirName 判断目录名是否是"纯季号"目录（不是真正的剧集名称）
+// 这种目录通常作为剧集名目录的子目录存在，例如 一拳超人/Season 01/xxx.mp4
+func isSeasonOnlyDirName(name string) bool {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return true
+	}
+	return seasonOnlyDirRe.MatchString(n)
+}
+
+// looksLikeSeriesFolder 判断给定目录看起来像一个"标准剧集合集"目录
+//  1. 直接含视频文件；或
+//  2. 含至少一个"季号"子目录（Season 01 / S01 / 第X季）；或
+//  3. 含 tvshow.nfo
+//
+// looksLikeSeriesFolder 判断指定目录是否"看起来像一个剧集文件夹"
+// 严格条件：必须出现以下任一明确特征：
+//  1. 目录内含 tvshow.nfo
+//  2. 目录内含明确的 Season XX 子目录（即标准剧集合集结构）
+//  3. 目录内含视频文件，且这些视频从命名上看是剧集（含 SxxExx / 第x集 等明确剧集关键字）
+//
+// 旧实现"任何子目录里有视频文件就返回 true"会被混合库误命中（如 _unsorted 目录有零散视频
+// 时把整个 _organized 库根误判为剧集合集，导致不下钻、Movies/TV Shows 被合并）。
+func (s *ScannerService) looksLikeSeriesFolder(path string) bool {
+	entries, err := s.readDirLibraryPath(path)
+	if err != nil {
+		return false
+	}
+	var hasEpisodicVideo bool
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() {
+			lower := strings.ToLower(name)
+			if lower == "tvshow.nfo" {
+				return true
+			}
+			ext := strings.ToLower(filepath.Ext(name))
+			if supportedExts[ext] {
+				// 仅当文件名包含明确的剧集编号特征时才算
+				if hasEpisodicNamePattern(name) {
+					hasEpisodicVideo = true
+				}
+			}
+			continue
+		}
+		if isSeasonOnlyDirName(name) {
+			return true
+		}
+	}
+	return hasEpisodicVideo
+}
+
+// hasEpisodicNamePattern 文件名是否包含明确的"剧集编号"特征
+// 例如：S01E02 / s1e2 / 第03话 / 第3集 / EP05 / E12
+func hasEpisodicNamePattern(name string) bool {
+	lower := strings.ToLower(name)
+	// SxxExx / sxe
+	if matched, _ := regexp.MatchString(`(?i)\bs\d{1,2}[\s_.-]*e\d{1,3}\b`, lower); matched {
+		return true
+	}
+	// 中文剧集："第N集" / "第N话" / "第N回"
+	if matched, _ := regexp.MatchString(`第\s*\d{1,4}\s*[集话話回]`, name); matched {
+		return true
+	}
+	// "EP12" / "EP-12"
+	if matched, _ := regexp.MatchString(`(?i)\bep[\s_.-]*\d{1,3}\b`, lower); matched {
 		return true
 	}
 	return false
@@ -459,9 +547,45 @@ func (s *ScannerService) collectMediaRoots(root string, kind string) []string {
 		}
 
 		// 分类目录识别：
-		// - depth == 0：总是尝试穿透（用户把库根设在 xiaoya 上层也能工作）
+		// - depth == 0：默认尝试穿透（用户把库根设在 xiaoya 上层也能工作）；
+		//   但若子目录已经是"标准剧集合集结构"（含 Season XX 子目录或 tvshow.nfo 或视频），
+		//   则 root 本身就是真实媒体根，绝不下钻——否则会把每个"剧集名目录"当作 root，
+		//   再把 Season XX 当成系列名，造成重大归类错乱（已发生过 bug）。
 		// - depth >  0：仅当目录名命中分类白名单 或 子目录数 >= 3（无视频+多子目录特征）
 		shouldExpand := depth == 0
+		if depth == 0 && len(subDirs) > 0 {
+			// [关键防御] 如果存在任何"已知分类目录"子目录（如 Movies / TV Shows / 电影 / 电视剧 / _unsorted），
+			// 必须下钻。这种结构下，root 自身绝不能被当作媒体根，否则会把分类目录当成"一部剧"。
+			hasCategorySub := false
+			for _, sd := range subDirs {
+				if isCategoryDirName(sd.Name()) {
+					hasCategorySub = true
+					break
+				}
+			}
+			if hasCategorySub {
+				s.logger.Infof("[xiaoya] 检测到 %s 下存在标准分类目录子项（如 Movies/TV Shows/电影/电视剧），强制下钻", path)
+				// 跳过下面的"抽样判断"，直接进入展开流程
+			} else {
+				// 抽样检查前若干个子目录，只要有一个看起来像剧集合集，就把 root 自身当媒体根
+				sampleN := len(subDirs)
+				if sampleN > 8 {
+					sampleN = 8
+				}
+				for i := 0; i < sampleN; i++ {
+					sd := subDirs[i]
+					if isXiaoyaSkipDir(sd.Name()) || extrasExcludeDirs[strings.ToLower(sd.Name())] {
+						continue
+					}
+					childPath := vfsJoin(path, sd.Name())
+					if s.looksLikeSeriesFolder(childPath) {
+						s.logger.Infof("[xiaoya][tvshow] 检测到 %s 是标准剧集库根（子目录 %s 含季号/视频/NFO），不下钻", path, sd.Name())
+						results = append(results, path)
+						return
+					}
+				}
+			}
+		}
 		if !shouldExpand {
 			if isCategoryDirName(base) {
 				shouldExpand = true
@@ -1028,6 +1152,44 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 		}
 		s.logger.Infof("混合库根 %s 包含 %d 个条目", root, len(entries))
 
+		// [关键判断] mediaRoot 自身是否就是一个"剧集名目录"
+		// 当 collectMediaRoots 把游标停在剧集名目录这一层（如 "TV Shows\\2.5次元的诱惑"）时，
+		// 它的子目录全是 Season XX，不能再当作"分类目录"用 normalizeSeriesName 来分组——
+		// 否则所有剧集都会因子目录名相同（"Season 01"）合并到一个空 key 里造成大灾难。
+		// 这里直接把 mediaRoot 自身作为 series 目录处理，dirName 用 mediaRoot 的 basename。
+		rootIsSeriesFolder := false
+		seasonChildCount := 0
+		nonSeasonChildCount := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				if isSeasonOnlyDirName(e.Name()) {
+					seasonChildCount++
+				} else if !isXiaoyaSkipDir(e.Name()) && !extrasExcludeDirs[strings.ToLower(e.Name())] {
+					nonSeasonChildCount++
+				}
+			}
+		}
+		if seasonChildCount > 0 && nonSeasonChildCount == 0 {
+			rootIsSeriesFolder = true
+		}
+
+		if rootIsSeriesFolder {
+			rootBase := filepath.Base(root)
+			normalizedName := s.normalizeSeriesName(rootBase)
+			if normalizedName == "" {
+				// 极端兜底：用原始名作 key 防止空键碰撞
+				normalizedName = "__series_" + rootBase
+			}
+			seasonNum := s.extractSeasonFromDirName(rootBase)
+			s.logger.Infof("[mixed] 媒体根 %s 自身识别为剧集目录（%d 个季子目录），序列名=%s", root, seasonChildCount, normalizedName)
+			seriesDirGroups[normalizedName] = append(seriesDirGroups[normalizedName], seriesFolder{
+				path:      root,
+				dirName:   rootBase,
+				seasonNum: seasonNum,
+			})
+			continue
+		}
+
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				// 根目录下的散落视频文件
@@ -1051,6 +1213,16 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 			if s.isTVShowFolder(folderPath) {
 				// 电视剧目录：按标准化系列名分组（支持多季合并）
 				normalizedName := s.normalizeSeriesName(dirName)
+				if normalizedName == "" {
+					// 防御：纯季号目录名（如 "Season 01"）出现在分类目录下属于异常结构，
+					// 用其父目录（mediaRoot）的 basename 作 fallback，避免空 key 合并
+					rootBase := filepath.Base(root)
+					normalizedName = s.normalizeSeriesName(rootBase)
+					if normalizedName == "" {
+						normalizedName = "__series_" + rootBase + "_" + dirName
+					}
+					s.logger.Warnf("[mixed] 子目录 %s 是纯季号目录，使用父目录名作系列名 fallback: %s", dirName, normalizedName)
+				}
 				seasonNum := s.extractSeasonFromDirName(dirName)
 				seriesDirGroups[normalizedName] = append(seriesDirGroups[normalizedName], seriesFolder{
 					path:      folderPath,
@@ -1361,13 +1533,17 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 	var totalNewEpisodes int
 
 	allPaths := library.AllPaths()
-	s.logger.Infof("剧集库扫描开始: %s, 路径数: %d", library.Name, len(allPaths))
+	s.logger.Infof("剧集库扫描开始: %s, 路径数: %d, 路径列表: %v", library.Name, len(allPaths), allPaths)
 
 	// [xiaoya 适配] 将所有媒体库根展开为多个"真实剧集根"
 	// 普通用户的平铺目录会返回 [library.AllPaths()]（完全向后兼容）
 	var mediaRoots []string
 	for _, p := range allPaths {
 		mediaRoots = append(mediaRoots, s.collectMediaRoots(p, "tvshow")...)
+	}
+	s.logger.Infof("[剧集扫描] 展开后的媒体根目录数: %d", len(mediaRoots))
+	for i, mr := range mediaRoots {
+		s.logger.Infof("[剧集扫描]   媒体根[%d]: %s", i, mr)
 	}
 
 	// 收集根目录下的散落视频文件，按系列名分组（跨所有 roots）
@@ -1426,12 +1602,41 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 			normalizedName := s.normalizeSeriesName(dirName)
 			seasonNum := s.extractSeasonFromDirName(dirName)
 
+			// 防御：如果目录名本身是"纯季号目录"（如 Season 01、S01、第一季），
+			// 说明当前 root 根本不是剧集名目录、而是某个剧集名目录本身。
+			// 使用 root 的 basename 作为系列名，并从该目录名反推季号。
+			if normalizedName == "" || isSeasonOnlyDirName(dirName) {
+				rootBase := filepath.Base(root)
+				fallback := s.normalizeSeriesName(rootBase)
+				if fallback == "" {
+					fallback = s.extractSeriesTitle(rootBase)
+				}
+				if fallback == "" {
+					fallback = rootBase
+				}
+				s.logger.Warnf("[剧集扫描] 检测到纯季号子目录: %s（位于 %s），使用父目录名作为系列名: %s", dirName, root, fallback)
+				normalizedName = fallback
+				if seasonNum == 0 {
+					seasonNum = s.extractSeasonFromDirName(dirName)
+				}
+			}
+
 			seriesDirGroups[normalizedName] = append(seriesDirGroups[normalizedName], seriesFolder{
 				path:      folderPath,
 				dirName:   dirName,
 				seasonNum: seasonNum,
 			})
 		}
+	}
+
+	// [剧集扫描] 诊断日志：打印 seriesDirGroups 分组结果
+	s.logger.Infof("[剧集扫描] 系列目录分组完成，共 %d 个分组", len(seriesDirGroups))
+	for name, folders := range seriesDirGroups {
+		dirNames := make([]string, 0, len(folders))
+		for _, f := range folders {
+			dirNames = append(dirNames, f.dirName)
+		}
+		s.logger.Infof("[剧集扫描]   系列 \"%s\" -> %d 个目录: %v", name, len(folders), dirNames)
 	}
 
 	// === 阶段二：处理分组后的目录 ===
@@ -1604,22 +1809,45 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 	return totalNewEpisodes, nil
 }
 
-// normalizeSeriesName 标准化系列名：从目录名中去掉季号标识，返回纯系列名
-// 例如: "一拳超人 S1" → "一拳超人", "Breaking Bad Season 2" → "Breaking Bad", "一拳超人 第二季" → "一拳超人"
+// normalizeSeriesName 标准化系列名：从目录名中去掉季号标识、idtag、年份后缀，返回纯系列名
+// 例如:
+//
+//	"一拳超人 S1"                              → "一拳超人"
+//	"Breaking Bad Season 2"                    → "Breaking Bad"
+//	"一拳超人 第二季"                          → "一拳超人"
+//	"一拳超人 第二季 (2018) [tmdbid-74956]"    → "一拳超人"
 func (s *ScannerService) normalizeSeriesName(dirName string) string {
+	// 防御：如果输入本身就是"纯季号目录名"（Season 01 / S01 / 第X季），
+	// 它绝不可能是剧集标题，直接返回空字符串，让调用方走特殊处理逻辑，
+	// 避免把不同剧集的 Season XX 错误归并到同一个系列。
+	if isSeasonOnlyDirName(dirName) {
+		return ""
+	}
+
 	title := s.extractSeriesTitle(dirName) // 先清理年份、编码等标记
+
+	// 移除 idtag 标记（[tmdbid-xxx] / [imdbid-xxx]），它们可能出现在标题尾部
+	idtagPattern := regexp.MustCompile(`(?i)\s*\[(tmdbid|imdbid|tvdbid)-[^\]]+\]\s*`)
+	title = idtagPattern.ReplaceAllString(title, " ")
+
+	// 移除年份 (1900) - (2099)（即使是中间出现）
+	yearMidPattern := regexp.MustCompile(`\s*[\(\[]\s*(19|20)\d{2}\s*[\)\]]\s*`)
+	title = yearMidPattern.ReplaceAllString(title, " ")
 
 	// 移除季号标识
 	seasonPatterns := []string{
 		`(?i)\s*S\d{1,2}\s*$`,            // 末尾 S1, S02
 		`(?i)\s*Season\s*\d{1,2}\s*$`,    // 末尾 Season 1
 		`\s*第\s*[一二三四五六七八九十\d]+\s*季\s*$`, // 末尾 第一季, 第2季
+		`\s*第\s*[一二三四五六七八九十\d]+\s*部\s*$`, // 末尾 第一部, 第2部
 	}
 	for _, p := range seasonPatterns {
 		re := regexp.MustCompile(p)
 		title = re.ReplaceAllString(title, "")
 	}
 
+	// 收敛多余空格
+	title = regexp.MustCompile(`\s+`).ReplaceAllString(title, " ")
 	title = strings.TrimSpace(title)
 	if title == "" {
 		// 如果标准化后为空（极端情况），回退使用原始清理标题

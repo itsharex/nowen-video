@@ -15,22 +15,22 @@ import (
 
 // LibraryService 媒体库服务
 type LibraryService struct {
-	repo                *repository.LibraryRepo
-	mediaRepo           *repository.MediaRepo
-	seriesRepo          *repository.SeriesRepo
-	favRepo             *repository.FavoriteRepo               // 收藏仓储（用于级联清理）
-	historyRepo         *repository.WatchHistoryRepo           // 观看历史仓储（用于级联清理）
-	mediaPersonRepo     *repository.MediaPersonRepo            // 演职人员关联仓储（用于级联清理刮削数据）
-	scanClassificationRepo *repository.ScanClassificationRepo  // 扫描归类仓储（用于级联清理分类记录）
-	cfg                 *config.Config                         // 用于访问 CacheDir 以清理磁盘上的刮削缓存
-	scanner             *ScannerService
-	metadata            *MetadataService
-	seriesService       *SeriesService     // 剧集合集服务（用于扫描后自动合并）
-	collectionService   *CollectionService // 电影系列合集服务（用于扫描后自动匹配）
-	logger              *zap.SugaredLogger
-	scanning            sync.Map            // 记录正在扫描的媒体库ID
-	wsHub               *WSHub              // WebSocket事件广播
-	fileWatcher         *FileWatcherService // 文件监听服务
+	repo                   *repository.LibraryRepo
+	mediaRepo              *repository.MediaRepo
+	seriesRepo             *repository.SeriesRepo
+	favRepo                *repository.FavoriteRepo           // 收藏仓储（用于级联清理）
+	historyRepo            *repository.WatchHistoryRepo       // 观看历史仓储（用于级联清理）
+	mediaPersonRepo        *repository.MediaPersonRepo        // 演职人员关联仓储（用于级联清理刮削数据）
+	scanClassificationRepo *repository.ScanClassificationRepo // 扫描归类仓储（用于级联清理分类记录）
+	cfg                    *config.Config                     // 用于访问 CacheDir 以清理磁盘上的刮削缓存
+	scanner                *ScannerService
+	metadata               *MetadataService
+	seriesService          *SeriesService     // 剧集合集服务（用于扫描后自动合并）
+	collectionService      *CollectionService // 电影系列合集服务（用于扫描后自动匹配）
+	logger                 *zap.SugaredLogger
+	scanning               sync.Map            // 记录正在扫描的媒体库ID
+	wsHub                  *WSHub              // WebSocket事件广播
+	fileWatcher            *FileWatcherService // 文件监听服务
 }
 
 func NewLibraryService(
@@ -47,17 +47,17 @@ func NewLibraryService(
 	logger *zap.SugaredLogger,
 ) *LibraryService {
 	return &LibraryService{
-		repo:                    repo,
-		mediaRepo:               mediaRepo,
-		seriesRepo:              seriesRepo,
-		favRepo:                 favRepo,
-		historyRepo:             historyRepo,
-		mediaPersonRepo:         mediaPersonRepo,
-		scanClassificationRepo:  scanClassificationRepo,
-		cfg:                     cfg,
-		scanner:                 scanner,
-		metadata:                metadata,
-		logger:                  logger,
+		repo:                   repo,
+		mediaRepo:              mediaRepo,
+		seriesRepo:             seriesRepo,
+		favRepo:                favRepo,
+		historyRepo:            historyRepo,
+		mediaPersonRepo:        mediaPersonRepo,
+		scanClassificationRepo: scanClassificationRepo,
+		cfg:                    cfg,
+		scanner:                scanner,
+		metadata:               metadata,
+		logger:                 logger,
 	}
 }
 
@@ -331,6 +331,14 @@ func (s *LibraryService) Scan(id string) error {
 				s.logger.Warnf("媒体库 %s 自动匹配合集失败: %v", lib.Name, err)
 			} else if collCount > 0 {
 				s.logger.Infof("媒体库 %s 自动创建 %d 个电影系列合集", lib.Name, collCount)
+			}
+
+			// 同片多版本折叠：将同一部电影的不同版本标记为 duplicate_of，
+			// 让前端列表默认只展示主版本，避免同一部片占据 N 张卡片。
+			if marked, err := s.scanner.MarkDuplicates(id); err != nil {
+				s.logger.Warnf("媒体库 %s 标记重复版本失败: %v", lib.Name, err)
+			} else if marked > 0 {
+				s.logger.Infof("媒体库 %s 标记 %d 个同片副本（列表默认隐藏）", lib.Name, marked)
 			}
 		}
 
@@ -640,6 +648,13 @@ func (s *LibraryService) Reindex(id string) error {
 				s.logger.Warnf("媒体库 %s 重建索引后自动匹配合集失败: %v", lib.Name, err)
 			} else if collCount > 0 {
 				s.logger.Infof("媒体库 %s 重建索引后自动创建 %d 个电影系列合集", lib.Name, collCount)
+			}
+
+			// 同片多版本折叠：同 Scan 流程一致
+			if marked, err := s.scanner.MarkDuplicates(id); err != nil {
+				s.logger.Warnf("媒体库 %s 重建索引后标记重复版本失败: %v", lib.Name, err)
+			} else if marked > 0 {
+				s.logger.Infof("媒体库 %s 重建索引后标记 %d 个同片副本（列表默认隐藏）", lib.Name, marked)
 			}
 		}
 

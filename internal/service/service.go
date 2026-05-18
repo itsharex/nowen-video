@@ -85,6 +85,10 @@ type Services struct {
 	SmartRename *SmartRenameService
 	// 扫描后处理：虚拟归类与命名映射（仅 DB 层；不动磁盘）
 	ScanPostProcess *ScanPostProcessService
+	// 懒人入库：源目录 → AI 自动分类/命名 → 建库 → 扫描
+	LazyIngest *LazyIngestService
+	// AI 成本：模型 catalog + 估价 + 累计花费
+	AICost *AICostService
 }
 
 func NewServices(repos *repository.Repositories, cfg *config.Config, logger *zap.SugaredLogger) *Services {
@@ -380,6 +384,16 @@ func NewServices(repos *repository.Repositories, cfg *config.Config, logger *zap
 		aiService, scanPostCfg, logger,
 	)
 	svcs.ScanPostProcess.Start()
+
+	// 懒人入库服务（依赖 SmartRename + Library + ScanPostProcess + DB）
+	svcs.LazyIngest = NewLazyIngestService(
+		repos.DB(), svcs.SmartRename, svcs.Library, svcs.ScanPostProcess,
+		DefaultLazyIngestConfig(), logger,
+	)
+	svcs.LazyIngest.SetWSHub(wsHub)
+
+	// AI 成本估算服务（无状态，仅依赖 AIService 取累计 token）
+	svcs.AICost = NewAICostService(aiService)
 
 	// 启动调度器（后台循环，默认未启用，需配置开启）
 	adultScheduler.Start()

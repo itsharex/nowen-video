@@ -48,6 +48,7 @@ import ClassificationTab from '@/components/admin/ClassificationTab'
 
 
 import { useTranslation } from '@/i18n'
+import { useDialog } from '@/components/Dialog'
 
 // ==================== 标签页定义 ====================
 const TABS = [
@@ -207,6 +208,7 @@ function TabScrollNav({
 }
 
 export default function AdminPage() {
+  const dialog = useDialog()
   // 从 URL hash 读取初始标签
   const getInitialTab = (): TabId => {
     const hash = window.location.hash.replace('#', '')
@@ -462,7 +464,12 @@ export default function AdminPage() {
   }
 
   const handleClearTMDbKey = async () => {
-    if (!confirm(t('admin.tmdbClearConfirm'))) return
+    const ok = await dialog.confirm({
+      title: t('admin.tmdbClearConfirm'),
+      confirmText: t('admin.confirm') || '确定',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       const res = await adminApi.clearTMDbConfig()
       setTmdbConfig(res.data.data)
@@ -528,7 +535,13 @@ export default function AdminPage() {
   }
 
   const handleClearDoubanCookie = async () => {
-    if (!confirm('确定要清除豆瓣 Cookie 吗？清除后豆瓣刮削将回退到匿名模式（成功率较低）。')) return
+    const ok = await dialog.confirm({
+      title: '清除豆瓣 Cookie',
+      message: '确定要清除豆瓣 Cookie 吗？清除后豆瓣刮削将回退到匿名模式（成功率较低）。',
+      confirmText: '清除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       const res = await adminApi.clearDoubanConfig()
       setDoubanConfig(res.data.data)
@@ -612,7 +625,12 @@ export default function AdminPage() {
       }
       // 回退：弹出 prompt 让用户手动粘贴
       if (!cookie) {
-        const input = window.prompt('无法自动读取剪贴板，请在下方手动粘贴豆瓣 Cookie：', '')
+        const input = await dialog.prompt({
+          title: '手动粘贴豆瓣 Cookie',
+          message: '无法自动读取剪贴板，请在下方手动粘贴豆瓣 Cookie：',
+          placeholder: '粘贴完整 Cookie 字符串',
+          multiline: true,
+        })
         cookie = (input || '').trim()
       }
       cookie = cookie.trim()

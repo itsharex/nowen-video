@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { playlistApi, streamApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { useTranslation } from '@/i18n'
 import { usePagination } from '@/hooks/usePagination'
 import Pagination from '@/components/Pagination'
@@ -24,6 +25,7 @@ export default function PlaylistsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const toast = useToast()
   const { t } = useTranslation()
+  const dialog = useDialog()
 
   // 分页（前端分页：后端返回用户全部列表，一般数量不大）
   const { page, size, setPage, setSize, totalPages } = usePagination({ initialSize: 10 })
@@ -56,7 +58,13 @@ export default function PlaylistsPage() {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm(t('playlists.deleteConfirm'))) return
+    const ok = await dialog.confirm({
+      title: t('playlists.deleteConfirmTitle') || '删除播放列表',
+      message: t('playlists.deleteConfirm'),
+      confirmText: t('playlists.delete') || '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await playlistApi.delete(id)
       setPlaylists((p) => p.filter((pl) => pl.id !== id))

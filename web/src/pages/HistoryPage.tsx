@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import { userApi, streamApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { useTranslation } from '@/i18n'
 import { usePageCache, invalidatePageCachePrefix } from '@/hooks/usePageCache'
 import { usePagination } from '@/hooks/usePagination'
@@ -21,6 +22,7 @@ export default function HistoryPage() {
   })
   const toast = useToast()
   const { t } = useTranslation()
+  const dialog = useDialog()
 
   const { data, loading, mutate, refetch } = usePageCache<HistoryData>(
     `history:page=${page}:size=${size}`,
@@ -49,7 +51,13 @@ export default function HistoryPage() {
   }
 
   const handleClear = async () => {
-    if (!confirm(t('history.clearConfirm'))) return
+    const ok = await dialog.confirm({
+      title: t('history.clearConfirmTitle') || '清空观看历史',
+      message: t('history.clearConfirm'),
+      confirmText: t('history.clear') || '清空',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await userApi.clearHistory()
       mutate({ list: [], total: 0 })

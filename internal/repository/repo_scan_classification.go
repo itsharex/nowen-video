@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"errors"
 	"time"
 
 	"github.com/nowen-video/nowen-video/internal/model"
@@ -27,22 +28,27 @@ func (r *ScanClassificationRepo) DB() *gorm.DB {
 }
 
 // Upsert 按 MediaID 覆盖写入：存在则更新，不存在则创建。
+//
+// 在事务中执行，避免「查不到 -> 并发插入 -> 唯一键冲突」。
+// gorm v2 下不推荐 == 比较错误，采用 errors.Is。
 func (r *ScanClassificationRepo) Upsert(c *model.MediaClassification) error {
 	if c == nil || c.MediaID == "" {
 		return gorm.ErrInvalidData
 	}
-	var existing model.MediaClassification
-	err := r.db.Where("media_id = ?", c.MediaID).First(&existing).Error
-	if err == gorm.ErrRecordNotFound {
-		return r.db.Create(c).Error
-	}
-	if err != nil {
-		return err
-	}
-	// 保留 ID/CreatedAt，其他字段全替换
-	c.ID = existing.ID
-	c.CreatedAt = existing.CreatedAt
-	return r.db.Save(c).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var existing model.MediaClassification
+		err := tx.Where("media_id = ?", c.MediaID).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return tx.Create(c).Error
+		}
+		if err != nil {
+			return err
+		}
+		// 保留 ID/CreatedAt，其他字段全替换
+		c.ID = existing.ID
+		c.CreatedAt = existing.CreatedAt
+		return tx.Save(c).Error
+	})
 }
 
 // MarkRunning 把若干 MediaID 标为 running（异步队列状态推进）
@@ -81,12 +87,12 @@ func (r *ScanClassificationRepo) FindByMediaID(mediaID string) (*model.MediaClas
 
 // ListFilter 列表查询过滤参数
 type ClassificationListFilter struct {
-	LibraryID string // 可选
-	Status    string // 可选 pending/running/processed/partial/failed
-	Category  string // 可选 movie/tvshow/...
-	Region    string // 可选 CN/JP/...
-	Decade    string // 可选 2020s/2010s/...
-	Keyword   string // 可选：模糊匹配 ParsedTitle/SuggestedName
+	LibraryID string  // 可选
+	Status    string  // 可选 pending/running/processed/partial/failed
+	Category  string  // 可选 movie/tvshow/...
+	Region    string  // 可选 CN/JP/...
+	Decade    string  // 可选 2020s/2010s/...
+	Keyword   string  // 可选：模糊匹配 ParsedTitle/SuggestedName
 	MinScore  float64 // 可选：confidence >=
 	Page      int
 	Size      int
@@ -170,7 +176,7 @@ func (r *ScanClassificationRepo) Stats(libraryID string) (*ClassificationStats, 
 			Count int64  `gorm:"column:count"`
 		}
 		q := r.db.Model(&model.MediaClassification{}).
-			Select(field+" as key, COUNT(*) as count").
+			Select(field + " as key, COUNT(*) as count").
 			Where(field + " != ''")
 		if libraryID != "" {
 			q = q.Where("library_id = ?", libraryID)

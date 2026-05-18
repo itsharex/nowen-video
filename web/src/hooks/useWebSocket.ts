@@ -65,6 +65,8 @@ export const WS_EVENTS = {
   // 文件夹操作事件
   FOLDER_RENAMED: 'folder_renamed',
   FOLDER_DELETED: 'folder_deleted',
+  // 懒人入库（一键入库）事件
+  INGEST_PROGRESS: 'ingest_progress',
 } as const
 
 export type WSEventType = (typeof WS_EVENTS)[keyof typeof WS_EVENTS]

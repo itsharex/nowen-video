@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,8 +58,12 @@ type AIErrorLog struct {
 
 // AIService AI 功能统一服务
 type AIService struct {
-	cfg       config.AIConfig
-	appCfg    *config.Config
+	// cfgMu 保护 cfg 的读/写，避免“热更新”与“并发请求读取 Profiles map”类场景下发生
+	// concurrent map read and map write 。
+	cfgMu  sync.RWMutex
+	cfg    config.AIConfig
+	appCfg *config.Config
+
 	mediaRepo *repository.MediaRepo
 	logger    *zap.SugaredLogger
 	client    *http.Client
@@ -74,6 +79,14 @@ type AIService struct {
 	// 限流
 	lastRequest time.Time
 	rateMu      sync.Mutex
+
+	// 全局 429 冷却闸（cooldownMu 同时保护 cooldownUntil 和 cooldownReason）。
+	// 任何一次请求收到 429（或 Retry-After）都会把 cooldownUntil 设到未来时刻，
+	// 期间所有请求（含重试请求）在 rateLimit() 中统一阻塞等待，
+	// 避免高并发下"A 在退避、B/C 还在打"的恶性循环导致整批被服务端拉黑。
+	cooldownMu     sync.Mutex
+	cooldownUntil  time.Time
+	cooldownReason string
 
 	// 月度调用计数
 	monthlyCount int
@@ -103,9 +116,19 @@ func NewAIService(cfg config.AIConfig, appCfg *config.Config, mediaRepo *reposit
 		timeout = 30
 	}
 
+	// 默认参数：偏保守，避开主流云端 LLM 服务（OpenAI / 阿里云百炼 / DeepSeek）的免费/低档限流
+	//   - max_concurrent = 1   ：避免单 Key 多通道并行打 API 触发 RPM 限流
+	//   - request_interval_ms = 1100 ：≈ 0.9 QPS，远低于 60 QPM 免费档上限
+	// 用户在前端"AI 高级设置"里可显式调高（专业版套餐通常没有 RPM 限制）。
 	maxConcurrent := cfg.MaxConcurrent
 	if maxConcurrent <= 0 {
-		maxConcurrent = 3
+		maxConcurrent = 1
+	}
+	if cfg.RequestIntervalMs <= 0 {
+		cfg.RequestIntervalMs = 1100
+	}
+	if cfg.CacheTTLHours <= 0 {
+		cfg.CacheTTLHours = 24 * 30 // 默认缓存 30 天，命名识别结果几乎不变
 	}
 
 	s := &AIService{
@@ -138,6 +161,8 @@ func NewAIService(cfg config.AIConfig, appCfg *config.Config, mediaRepo *reposit
 // AutoPilot 语义：只要配了 APIKey 与 APIBase，即使 Enabled=false 也会被视为启用，
 // 从而避免「用户填了 key 却忘记打 enabled 开关」造成的 AI 不生效。
 func (s *AIService) IsEnabled() bool {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	if s.cfg.APIKey == "" || s.cfg.APIBase == "" {
 		return false
 	}
@@ -149,45 +174,94 @@ func (s *AIService) IsEnabled() bool {
 
 // Provider 返回当前生效的 AI 服务商（来自 AI 配置中心，可在管理面板动态切换）
 func (s *AIService) Provider() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return s.cfg.Provider
 }
 
 // Model 返回当前生效的 AI 模型
 func (s *AIService) Model() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return s.cfg.Model
 }
 
 // IsSmartSearchEnabled 检查智能搜索是否启用
 func (s *AIService) IsSmartSearchEnabled() bool {
-	return s.IsEnabled() && (s.cfg.AutoPilot || s.cfg.EnableSmartSearch)
+	if !s.IsEnabled() {
+		return false
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.AutoPilot || s.cfg.EnableSmartSearch
 }
 
 // IsRecommendReasonEnabled 检查推荐理由生成是否启用
 func (s *AIService) IsRecommendReasonEnabled() bool {
-	return s.IsEnabled() && (s.cfg.AutoPilot || s.cfg.EnableRecommendReason)
+	if !s.IsEnabled() {
+		return false
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.AutoPilot || s.cfg.EnableRecommendReason
 }
 
 // IsMetadataEnhanceEnabled 检查元数据增强是否启用
 func (s *AIService) IsMetadataEnhanceEnabled() bool {
-	return s.IsEnabled() && (s.cfg.AutoPilot || s.cfg.EnableMetadataEnhance)
+	if !s.IsEnabled() {
+		return false
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.AutoPilot || s.cfg.EnableMetadataEnhance
 }
 
 // IsAutoPilotEnabled 是否处于全自动托管模式
 func (s *AIService) IsAutoPilotEnabled() bool {
-	return s.IsEnabled() && s.cfg.AutoPilot
+	if !s.IsEnabled() {
+		return false
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.AutoPilot
+}
+
+// snapshotCfg 返回当前 cfg 的一个“使用脚手架”，包含主要只读字段。
+// Profiles 是 map，拷贝为新 map 以避免上层考察 map 时发生读写竞争。
+func (s *AIService) snapshotCfg() config.AIConfig {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	cp := s.cfg
+	if s.cfg.Profiles != nil {
+		cp.Profiles = make(map[string]config.AIProviderProfile, len(s.cfg.Profiles))
+		for k, v := range s.cfg.Profiles {
+			cp.Profiles[k] = v
+		}
+	}
+	return cp
 }
 
 // ==================== LLM 调用核心 ====================
 
 // ChatCompletion 调用 LLM 聊天补全 API
+//
+// 重试策略（针对常见的限流/瞬时错误）：
+//   - HTTP 429 / 5xx / 网络错误自动指数退避重试（最多 4 次：1s -> 2s -> 4s -> 8s）
+//   - 优先读取响应头中的 `Retry-After`（秒）作为退避时长
+//   - 4xx（除 429 外）直接返回，不重试，避免无效请求消耗配额
+//   - 整体最长等待 ≈ 15s，超过后返回最后一次错误
 func (s *AIService) ChatCompletion(systemPrompt, userPrompt string, temperature float64, maxTokens int) (string, error) {
 	if !s.IsEnabled() {
 		return "", fmt.Errorf("AI 服务未启用")
 	}
 
+	// 以“一次快照”在本次调用全程使用同一份 cfg，避免中途热更新导致 model/url 不一致，
+	// 并且避免与 UpdateConfig 发生“concurrent map read and map write”。
+	cfg := s.snapshotCfg()
+
 	// 云端强制：拦截本地 AI（如 ollama），避免「全自动托管」语义下走本地推理
-	if s.cfg.BlockLocalAI && isLocalAIProvider(s.cfg.Provider, s.cfg.APIBase) {
-		return "", fmt.Errorf("当前系统禁止本地 AI（provider=%s），请在 AI 配置中选择云端服务商（OpenAI/DeepSeek/通义千问）", s.cfg.Provider)
+	if cfg.BlockLocalAI && isLocalAIProvider(cfg.Provider, cfg.APIBase) {
+		return "", fmt.Errorf("当前系统禁止本地 AI（provider=%s），请在 AI 配置中选择云端服务商（OpenAI/DeepSeek/通义千问）", cfg.Provider)
 	}
 
 	// 预算检查
@@ -199,12 +273,9 @@ func (s *AIService) ChatCompletion(systemPrompt, userPrompt string, temperature 
 	s.semaphore <- struct{}{}
 	defer func() { <-s.semaphore }()
 
-	// 限流
-	s.rateLimit()
-
-	// 构建请求
+	// 构建请求体（一次构建，多次重试复用）
 	reqBody := ChatCompletionRequest{
-		Model: s.cfg.Model,
+		Model: cfg.Model,
 		Messages: []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
@@ -212,60 +283,133 @@ func (s *AIService) ChatCompletion(systemPrompt, userPrompt string, temperature 
 		Temperature: temperature,
 		MaxTokens:   maxTokens,
 	}
-
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("序列化请求失败: %w", err)
 	}
+	apiURL := strings.TrimRight(cfg.APIBase, "/") + "/chat/completions"
 
-	apiURL := strings.TrimRight(s.cfg.APIBase, "/") + "/chat/completions"
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
-	}
+	const maxAttempts = 4
+	var lastErr error
+	var respBody []byte
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// 限流（每次重试前都过一遍间隔限流）
+		s.rateLimit()
 
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("AI API 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
+		req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return "", fmt.Errorf("创建请求失败: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取响应失败: %w", err)
-	}
+		resp, err := s.client.Do(req)
+		if err != nil {
+			// 网络错误：可重试，写入全局冷却闸（让其他并发请求一起等）
+			lastErr = fmt.Errorf("AI API 请求失败: %w", err)
+			if attempt < maxAttempts {
+				wait := backoffDuration(attempt, "")
+				s.logger.Warnf("AI 调用网络错误，%v 后重试 (第 %d/%d 次): %v", wait, attempt, maxAttempts, err)
+				s.triggerCooldown(wait, fmt.Sprintf("network err: %v", err))
+				continue // rateLimit() 会在下次循环顶部尊重冷却闸
+			}
+			break
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		s.logger.Warnf("AI API 返回错误 (HTTP %d): %s", resp.StatusCode, string(respBody))
+		respBody, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("读取响应失败: %w", err)
+			if attempt < maxAttempts {
+				wait := backoffDuration(attempt, "")
+				s.triggerCooldown(wait, "read body err")
+				continue
+			}
+			break
+		}
+
+		// 成功
+		if resp.StatusCode == http.StatusOK {
+			var chatResp ChatCompletionResponse
+			if err := json.Unmarshal(respBody, &chatResp); err != nil {
+				return "", fmt.Errorf("解析 AI 响应失败: %w", err)
+			}
+			if len(chatResp.Choices) == 0 {
+				return "", fmt.Errorf("AI 未返回任何结果")
+			}
+			s.incrementCount()
+			s.tokenMu.Lock()
+			s.totalPromptTokens += chatResp.Usage.PromptTokens
+			s.totalCompletionTokens += chatResp.Usage.CompletionTokens
+			s.tokenMu.Unlock()
+			result := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+			s.logger.Debugf("AI 调用成功 (tokens: %d+%d=%d, attempt=%d)",
+				chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, chatResp.Usage.TotalTokens, attempt)
+			return result, nil
+		}
+
+		// 非 200：判断是否可重试
+		retryAfter := resp.Header.Get("Retry-After")
 		errMsg := fmt.Errorf("AI API 返回 HTTP %d", resp.StatusCode)
-		s.addErrorLog("chat_completion", errMsg, time.Since(time.Now()).Milliseconds())
+		lastErr = errMsg
+
+		retryable := resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusGatewayTimeout ||
+			(resp.StatusCode >= 500 && resp.StatusCode < 600)
+
+		if retryable && attempt < maxAttempts {
+			wait := backoffDuration(attempt, retryAfter)
+			s.logger.Warnf("AI API HTTP %d，%v 后重试 (第 %d/%d 次, 触发全局冷却): %s",
+				resp.StatusCode, wait, attempt, maxAttempts, truncateForLog(string(respBody), 200))
+			// 关键：写入全局冷却闸，所有并发请求（包括其他 worker）会在 rateLimit() 一起等
+			s.triggerCooldown(wait, fmt.Sprintf("HTTP %d", resp.StatusCode))
+			continue
+		}
+
+		// 不可重试 / 已达上限
+		s.logger.Warnf("AI API 返回错误 (HTTP %d): %s", resp.StatusCode, string(respBody))
+		s.addErrorLog("chat_completion", errMsg, 0)
 		return "", errMsg
 	}
 
-	var chatResp ChatCompletionResponse
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return "", fmt.Errorf("解析 AI 响应失败: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("AI 调用失败（未知原因）")
 	}
+	s.addErrorLog("chat_completion", lastErr, 0)
+	return "", lastErr
+}
 
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("AI 未返回任何结果")
+// backoffDuration 计算重试退避时长。
+//
+// 优先使用 Retry-After 头（OpenAI / 阿里云百炼 / 多数兼容服务返回 N 秒整数）。
+// 否则使用指数退避：1s -> 2s -> 4s -> 8s（最多 8s 单次）。
+func backoffDuration(attempt int, retryAfter string) time.Duration {
+	// 解析 Retry-After（秒数）
+	if retryAfter != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs > 0 {
+			if secs > 30 {
+				secs = 30 // 上限保护
+			}
+			return time.Duration(secs) * time.Second
+		}
 	}
+	// 指数退避：1s, 2s, 4s, 8s
+	wait := time.Second << (attempt - 1)
+	if wait > 8*time.Second {
+		wait = 8 * time.Second
+	}
+	return wait
+}
 
-	// 更新调用计数和 Token 统计
-	s.incrementCount()
-	s.tokenMu.Lock()
-	s.totalPromptTokens += chatResp.Usage.PromptTokens
-	s.totalCompletionTokens += chatResp.Usage.CompletionTokens
-	s.tokenMu.Unlock()
-
-	result := strings.TrimSpace(chatResp.Choices[0].Message.Content)
-	s.logger.Debugf("AI 调用成功 (tokens: %d+%d=%d)",
-		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, chatResp.Usage.TotalTokens)
-
-	return result, nil
+// truncateForLog 截断长字符串，仅用于日志展示
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // ==================== 缓存 ====================
@@ -283,11 +427,14 @@ func (s *AIService) GetCache(key string) (string, bool) {
 	// 第二层：持久化缓存
 	if s.cacheRepo != nil {
 		if val, found := s.cacheRepo.Get(key); found {
+			s.cfgMu.RLock()
+			ttl := s.cfg.CacheTTLHours
+			s.cfgMu.RUnlock()
 			// 回填内存缓存
 			s.cacheMu.Lock()
 			s.cache[key] = &aiCacheEntry{
 				Value:     val,
-				ExpiresAt: time.Now().Add(time.Duration(s.cfg.CacheTTLHours) * time.Hour),
+				ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Hour),
 			}
 			s.cacheMu.Unlock()
 			return val, true
@@ -299,7 +446,9 @@ func (s *AIService) GetCache(key string) (string, bool) {
 
 // SetCache 写入缓存（双层：同时写入内存和持久化存储）
 func (s *AIService) SetCache(key, value string) {
+	s.cfgMu.RLock()
 	ttl := s.cfg.CacheTTLHours
+	s.cfgMu.RUnlock()
 	if ttl <= 0 {
 		return // 不缓存
 	}
@@ -334,9 +483,38 @@ func (s *AIService) SetCache(key, value string) {
 
 // ==================== 限流与预算 ====================
 
-// rateLimit 请求间隔限流
+// rateLimit 请求间隔限流 + 全局 429 冷却闸。
+//
+// 顺序：
+//  1. 若全局冷却闸生效（来自上一次 429 / Retry-After），先阻塞等待到冷却结束；
+//  2. 再走最小请求间隔限流（避免同一秒内挤压新请求）。
+//
+// 关键点：cooldownUntil 用 cooldownMu 短暂上锁读取，sleep 时不持锁，
+// 防止 N 个请求互相阻塞导致退避后再次同时打 API。
 func (s *AIService) rateLimit() {
+	// 1) 全局 429 冷却闸
+	for {
+		s.cooldownMu.Lock()
+		until := s.cooldownUntil
+		reason := s.cooldownReason
+		s.cooldownMu.Unlock()
+		now := time.Now()
+		if !until.After(now) {
+			break
+		}
+		wait := until.Sub(now)
+		if wait > 30*time.Second {
+			wait = 30 * time.Second // 上限保护
+		}
+		s.logger.Debugf("AI 全局冷却中，等待 %v（原因: %s）", wait, reason)
+		time.Sleep(wait)
+		// 循环再次确认（其他请求可能在我们 sleep 期间又触发了新的 cooldown 延期）
+	}
+
+	// 2) 最小请求间隔
+	s.cfgMu.RLock()
 	interval := time.Duration(s.cfg.RequestIntervalMs) * time.Millisecond
+	s.cfgMu.RUnlock()
 	if interval <= 0 {
 		return
 	}
@@ -351,9 +529,32 @@ func (s *AIService) rateLimit() {
 	s.lastRequest = time.Now()
 }
 
+// triggerCooldown 触发全局 429 冷却闸。
+//
+// 入参 wait 为本次需要等待的时长（已由调用方综合 Retry-After / 指数退避算好）。
+// 函数将 cooldownUntil 推到 max(原 until, now+wait)：取较远者，
+// 保证多个请求"同时挨打"时不会被某个较早完成的退避把闸提前抬起。
+//
+// reason 仅用于日志展示。
+func (s *AIService) triggerCooldown(wait time.Duration, reason string) {
+	if wait <= 0 {
+		return
+	}
+	target := time.Now().Add(wait)
+	s.cooldownMu.Lock()
+	if target.After(s.cooldownUntil) {
+		s.cooldownUntil = target
+		s.cooldownReason = reason
+	}
+	s.cooldownMu.Unlock()
+}
+
 // checkBudget 检查月度预算
 func (s *AIService) checkBudget() bool {
-	if s.cfg.MonthlyBudget <= 0 {
+	s.cfgMu.RLock()
+	budget := s.cfg.MonthlyBudget
+	s.cfgMu.RUnlock()
+	if budget <= 0 {
 		return true // 不限制
 	}
 
@@ -366,7 +567,7 @@ func (s *AIService) checkBudget() bool {
 		s.countMonth = int(currentMonth)
 	}
 
-	return s.monthlyCount < s.cfg.MonthlyBudget
+	return s.monthlyCount < budget
 }
 
 // incrementCount 增加调用计数
@@ -416,26 +617,27 @@ func isLocalAIProvider(provider, apiBase string) bool {
 
 // GetStatus 获取 AI 服务状态（用于前端展示）
 func (s *AIService) GetStatus() map[string]interface{} {
+	cfg := s.snapshotCfg()
 	status := map[string]interface{}{
-		"enabled":                 s.cfg.Enabled,
-		"auto_pilot":              s.cfg.AutoPilot,
-		"block_local_ai":          s.cfg.BlockLocalAI,
-		"provider":                s.cfg.Provider,
-		"model":                   s.cfg.Model,
-		"api_base":                s.cfg.APIBase,
-		"api_configured":          s.cfg.APIKey != "",
-		"timeout":                 s.cfg.Timeout,
-		"enable_smart_search":     s.cfg.EnableSmartSearch,
-		"enable_recommend_reason": s.cfg.EnableRecommendReason,
-		"enable_metadata_enhance": s.cfg.EnableMetadataEnhance,
-		"cache_ttl_hours":         s.cfg.CacheTTLHours,
-		"max_concurrent":          s.cfg.MaxConcurrent,
-		"request_interval_ms":     s.cfg.RequestIntervalMs,
+		"enabled":                 cfg.Enabled,
+		"auto_pilot":              cfg.AutoPilot,
+		"block_local_ai":          cfg.BlockLocalAI,
+		"provider":                cfg.Provider,
+		"model":                   cfg.Model,
+		"api_base":                cfg.APIBase,
+		"api_configured":          cfg.APIKey != "",
+		"timeout":                 cfg.Timeout,
+		"enable_smart_search":     cfg.EnableSmartSearch,
+		"enable_recommend_reason": cfg.EnableRecommendReason,
+		"enable_metadata_enhance": cfg.EnableMetadataEnhance,
+		"cache_ttl_hours":         cfg.CacheTTLHours,
+		"max_concurrent":          cfg.MaxConcurrent,
+		"request_interval_ms":     cfg.RequestIntervalMs,
 	}
 
 	// 多 provider 配置档案（key 字段脱敏，仅返回 api_key_configured 标识）
-	profilesView := make(map[string]map[string]interface{}, len(s.cfg.Profiles))
-	for id, p := range s.cfg.Profiles {
+	profilesView := make(map[string]map[string]interface{}, len(cfg.Profiles))
+	for id, p := range cfg.Profiles {
 		profilesView[id] = map[string]interface{}{
 			"api_base":           p.APIBase,
 			"model":              p.Model,
@@ -446,7 +648,7 @@ func (s *AIService) GetStatus() map[string]interface{} {
 
 	s.countMu.Lock()
 	status["monthly_calls"] = s.monthlyCount
-	status["monthly_budget"] = s.cfg.MonthlyBudget
+	status["monthly_budget"] = cfg.MonthlyBudget
 	s.countMu.Unlock()
 
 	s.tokenMu.Lock()
@@ -477,6 +679,8 @@ func (s *AIService) GetStatus() map[string]interface{} {
 //  4. 同步顶层激活配置 → s.cfg.Profiles[provider]，确保两者一致
 //  5. 持久化到 config/ai.yaml
 func (s *AIService) UpdateConfig(updates map[string]interface{}) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	for key, val := range updates {
 		switch key {
 		case "enabled":
@@ -570,8 +774,8 @@ func (s *AIService) UpdateConfig(updates map[string]interface{}) error {
 }
 
 // mergeProfilesUpdate 合并前端传来的 profiles 增量到 s.cfg.Profiles
-// 输入应为 map[string]interface{}，每个值为 map{api_base, api_key, model}
-// api_key 为空字符串时保留现有 key（避免误清空）
+// 调用者请确保已持有 cfgMu.Lock。输入应为 map[string]interface{}，
+// 每个值为 map{api_base, api_key, model}；api_key 为空字符串时保留现有 key
 func (s *AIService) mergeProfilesUpdate(val interface{}) {
 	raw, ok := val.(map[string]interface{})
 	if !ok {
@@ -622,7 +826,8 @@ func (s *AIService) syncActiveProfile() {
 // TestConnection 测试 AI API 连接
 // 注意：此方法绕过 IsEnabled() 检查，直接验证 API 密钥和网络连通性
 func (s *AIService) TestConnection() (map[string]interface{}, error) {
-	if s.cfg.APIKey == "" || s.cfg.APIBase == "" {
+	cfg := s.snapshotCfg()
+	if cfg.APIKey == "" || cfg.APIBase == "" {
 		return nil, fmt.Errorf("API Key 或 API Base 未配置")
 	}
 
@@ -630,7 +835,7 @@ func (s *AIService) TestConnection() (map[string]interface{}, error) {
 
 	// 直接构建请求，绕过 ChatCompletion 中的 IsEnabled/预算检查
 	reqBody := ChatCompletionRequest{
-		Model: s.cfg.Model,
+		Model: cfg.Model,
 		Messages: []ChatMessage{
 			{Role: "system", Content: "你是一个测试助手。"},
 			{Role: "user", Content: "请回复 OK"},
@@ -644,14 +849,14 @@ func (s *AIService) TestConnection() (map[string]interface{}, error) {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	apiURL := strings.TrimRight(s.cfg.APIBase, "/") + "/chat/completions"
+	apiURL := strings.TrimRight(cfg.APIBase, "/") + "/chat/completions"
 	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
 	resp, err := s.client.Do(req)
 	latency := time.Since(start).Milliseconds()
@@ -707,8 +912,8 @@ func (s *AIService) TestConnection() (map[string]interface{}, error) {
 		"success":    true,
 		"response":   result,
 		"latency_ms": latency,
-		"provider":   s.cfg.Provider,
-		"model":      s.cfg.Model,
+		"provider":   cfg.Provider,
+		"model":      cfg.Model,
 	}, nil
 }
 

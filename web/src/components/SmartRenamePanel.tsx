@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
+import { useDialog } from './Dialog'
 import {
   smartRenameApi,
   parseRelatedFiles,
@@ -73,6 +74,7 @@ export default function SmartRenamePanel({
   onPlanChange,
   compact = false,
 }: SmartRenamePanelProps) {
+  const dialog = useDialog()
   const [rootPath, setRootPath] = useState(defaultPath)
   const [style, setStyle] = useState<NamingStyle>('jellyfin')
   const [enableAI, setEnableAI] = useState(true)
@@ -157,7 +159,13 @@ export default function SmartRenamePanel({
 
   async function onRollback() {
     if (!plan) return
-    if (!window.confirm('确定要回滚本次重命名吗？所有已落盘的文件将恢复原名。')) return
+    const ok = await dialog.confirm({
+      title: '回滚重命名',
+      message: '确定要回滚本次重命名吗？所有已落盘的文件将恢复原名。',
+      confirmText: '回滚',
+      variant: 'warning',
+    })
+    if (!ok) return
     setRollingBack(true)
     try {
       const resp = await smartRenameApi.rollback(plan.id)

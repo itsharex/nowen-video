@@ -4,9 +4,11 @@ import type { Library, CreateLibraryRequest } from '@/types'
 import { getLibraryPaths } from '@/types'
 import type { ScanProgressData, ScrapeProgressData, ScanPhaseData } from '@/hooks/useWebSocket'
 import { useToast } from './Toast'
+import { useDialog } from './Dialog'
 import CreateLibraryModal from './CreateLibraryModal'
 import EditLibraryModal from './EditLibraryModal'
 import SmartRenameDrawer from './SmartRenameDrawer'
+import LazyIngestModal from './LazyIngestModal'
 import {
   FolderPlus,
   RefreshCw,
@@ -25,6 +27,7 @@ import {
   RotateCcw,
   Pencil,
   Wand2,
+  Sparkles,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -56,7 +59,9 @@ export default function LibraryManager({
   scanPhase,
 }: LibraryManagerProps) {
   const toast = useToast()
+  const dialog = useDialog()
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [showLazyIngestModal, setShowLazyIngestModal] = useState(false)
   const [sortBy, setSortBy] = useState<'name' | 'created' | 'type'>('created')
   const [sortAsc, setSortAsc] = useState(false)
   const [activeMenu, setActiveMenu] = useState<string | null>(null)
@@ -112,17 +117,29 @@ export default function LibraryManager({
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('确定删除此媒体库？关联的媒体记录也会被清除。')) return
+    const ok = await dialog.confirm({
+      title: '删除媒体库',
+      message: '确定删除此媒体库？关联的媒体记录也会被清除。',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await libraryApi.delete(id)
       setLibraries((libs) => libs.filter((l) => l.id !== id))
     } catch {
-      alert('删除失败')
+      toast.error('删除失败')
     }
   }
 
   const handleReindex = async (id: string) => {
-    if (!confirm('确定重建索引？这将清除现有媒体记录并重新扫描文件。')) return
+    const ok = await dialog.confirm({
+      title: '重建索引',
+      message: '确定重建索引？这将清除现有媒体记录并重新扫描文件。',
+      confirmText: '重建',
+      variant: 'warning',
+    })
+    if (!ok) return
     setScanning((s) => new Set(s).add(id))
     try {
       await libraryApi.reindex(id)
@@ -132,7 +149,7 @@ export default function LibraryManager({
         ns.delete(id)
         return ns
       })
-      alert('重建索引失败')
+      toast.error('重建索引失败')
     }
   }
 
@@ -169,6 +186,21 @@ export default function LibraryManager({
         </h2>
 
         <div className="ml-auto flex items-center gap-2">
+          {/* 一键入库（AI 全自动）— 极简入口 */}
+          <button
+            onClick={() => setShowLazyIngestModal(true)}
+            className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-medium transition-all"
+            style={{
+              border: '1px solid var(--neon)',
+              color: 'var(--neon)',
+              background: 'var(--neon-tint, rgba(0,255,200,0.08))',
+            }}
+            title="只给一个目录，AI 自动整理 + 建库 + 扫描"
+          >
+            <Sparkles size={14} />
+            一键入库
+          </button>
+
           {/* 新增媒体库按钮 — 主要操作 */}
           <button
             onClick={() => setShowCreateModal(true)}
@@ -589,6 +621,19 @@ export default function LibraryManager({
         open={!!renamingLibrary}
         library={renamingLibrary}
         onClose={() => setRenamingLibrary(null)}
+      />
+
+      {/* ===== 一键入库（懒人模式） ===== */}
+      <LazyIngestModal
+        isOpen={showLazyIngestModal}
+        onClose={() => setShowLazyIngestModal(false)}
+        onCompleted={() => {
+          // 任务完成 → 刷新媒体库列表
+          libraryApi
+            .list()
+            .then((res) => setLibraries(res.data.data || []))
+            .catch(() => {})
+        }}
       />
     </section>
   )

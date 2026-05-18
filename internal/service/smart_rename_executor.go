@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +113,28 @@ func (e *renameExecutor) renameWithJournal(planID, itemID, src, tgt string, jour
 	if src == tgt {
 		return nil
 	}
+	// 防御：Windows 下 os.Rename 当 tgt 已存在时会失败（POSIX 会原子覆盖），
+	// 行为差异可能让用户在不同平台看到不同结果，统一为「目标已存在 -> 拒绝执行」，
+	// 由上层 safety/checkSafety 在规划阶段保证不会出现。这里是最后一道防线。
+	//
+	// 注意：通过 filepath.Clean + 平台大小写策略判定是否「同一路径不同写法」，
+	// 同一路径直接 return nil；不同路径但目标已存在则报错。
+	if pathEqual(src, tgt) {
+		return nil
+	}
+	if _, statErr := os.Stat(tgt); statErr == nil {
+		err := fmt.Errorf("rename target already exists: %s", tgt)
+		_ = e.repo.AppendJournal(&model.RenameJournal{
+			PlanID:   planID,
+			ItemID:   itemID,
+			Op:       model.RenameJournalOpMove,
+			FromPath: src,
+			ToPath:   tgt,
+			Success:  false,
+			Error:    err.Error(),
+		})
+		return err
+	}
 	// 优先 os.Rename；若失败（跨卷）回退到 copy+delete
 	err := os.Rename(src, tgt)
 	if err != nil && isCrossDeviceError(err) {
@@ -144,19 +167,47 @@ func (e *renameExecutor) renameWithJournal(planID, itemID, src, tgt string, jour
 	return nil
 }
 
-// rollbackLocal 回滚本条目已成功的 journal
+// rollbackLocal 回滚本条目已成功的 journal（含真正的物理逆操作）。
+//
+// 之前实现仅做 DB 标记，导致条目内主视频已 rename 但关联文件失败时，磁盘留下半成品状态。
+// 现按 ID 集合从 DB 取回明细并执行：
+//   - move：ToPath -> FromPath（同卷 Rename，跨卷 copyThenDelete）
+//   - mkdir：尝试删除空目录（非空忽略）
 func (e *renameExecutor) rollbackLocal(ids []uint64) {
 	if len(ids) == 0 {
 		return
 	}
-	// 倒序，按 ID 取
-	for i := len(ids) - 1; i >= 0; i-- {
-		id := ids[i]
-		// 简化：直接由 rollback() 全量回滚不必要，这里逐条做
-		// 因为我们没有 GetJournal API，这里只用 reverse rename / rmdir
-		// 由于 executor 仅在本机已知 ids，借用 repo 的 ListJournalByPlan 不实际查 ID。
-		// 这里只是把 journal 标记为 reverted，物理回滚由统一 rollback() 处理。
-		_ = e.repo.MarkJournalReverted(id, "local rollback after item failure")
+	journals, err := e.repo.ListJournalByIDs(ids)
+	if err != nil {
+		e.logger.Warnf("[SmartRename] 本条回滚查询 journal 失败 ids=%v: %v", ids, err)
+		// 退化为仅做 DB 标记，避免遗留数据混乱
+		for _, id := range ids {
+			_ = e.repo.MarkJournalReverted(id, "local rollback after item failure (no journal record)")
+		}
+		return
+	}
+	// 倒序回滚
+	for i := len(journals) - 1; i >= 0; i-- {
+		j := journals[i]
+		if !j.Success || j.Reverted {
+			continue
+		}
+		var revErr error
+		switch j.Op {
+		case model.RenameJournalOpMove:
+			if _, statErr := os.Stat(j.ToPath); statErr == nil {
+				revErr = os.Rename(j.ToPath, j.FromPath)
+				if revErr != nil && isCrossDeviceError(revErr) {
+					revErr = copyThenDelete(j.ToPath, j.FromPath)
+				}
+			}
+		case model.RenameJournalOpMkdir:
+			_ = os.Remove(j.ToPath)
+		}
+		if revErr != nil {
+			e.logger.Warnf("[SmartRename] 本条回滚失败 journal=%d: %v", j.ID, revErr)
+		}
+		_ = e.repo.MarkJournalReverted(j.ID, errMsg(revErr))
 	}
 }
 
@@ -259,33 +310,16 @@ func copyThenDelete(src, dst string) error {
 	return nil
 }
 
-// copyAll 32KB 缓冲拷贝（避免引入 io 间接依赖此处简单实现）
+// copyAll 复制内容；直接使用 io.Copy 以正确处理 io.EOF（标准库行为正确）。
+//
+// 之前的手撸实现用字符串后缀 "EOF" 判断，存在两类风险：
+//  1. 任何错误信息以 "EOF" 结尾都会被误判为 EOF，提前 return nil 导致拷贝不完整；
+//  2. 与 errors.Is(err, io.EOF) 的标准语义不一致，在不同平台/包装错误下行为不可控。
+//
+// 跨卷迁移随后会执行 os.Remove(src) —— 如果上面误判为成功，将造成数据丢失。
 func copyAll(dst *os.File, src *os.File) (int64, error) {
-	buf := make([]byte, 32*1024)
-	var total int64
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			nw, werr := dst.Write(buf[:n])
-			total += int64(nw)
-			if werr != nil {
-				return total, werr
-			}
-		}
-		if err != nil {
-			if err.Error() == "EOF" || errors.Is(err, errEOF) {
-				return total, nil
-			}
-			// io.EOF
-			if strings.HasSuffix(err.Error(), "EOF") {
-				return total, nil
-			}
-			return total, err
-		}
-	}
+	return io.Copy(dst, src)
 }
-
-var errEOF = errors.New("EOF")
 
 // isCrossVolume 仅做静态判定：Windows 看盘符；POSIX 用 syscall.Stat
 func isCrossVolume(a, b string) bool {

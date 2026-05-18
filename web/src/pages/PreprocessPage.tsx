@@ -66,6 +66,7 @@ function RingProgress({ value, max, size = 44, strokeWidth = 3, color = 'var(--n
 import { preprocessApi } from '@/api/preprocess'
 import { useWebSocket, WS_EVENTS } from '@/hooks/useWebSocket'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import { usePagination } from '@/hooks/usePagination'
 import Pagination from '@/components/Pagination'
 import type {
@@ -154,6 +155,7 @@ const statusIcons: Record<string, React.ReactNode> = {
 
 export default function PreprocessPage() {
   const toast = useToast()
+  const dialog = useDialog()
   const toastRef = useRef(toast)
   toastRef.current = toast
   const { on, off } = useWebSocket()
@@ -343,7 +345,13 @@ export default function PreprocessPage() {
   // 一键清理孤儿目录
   const handleCleanOrphan = useCallback(async () => {
     if (!storage || storage.orphan_count === 0) return
-    if (!confirm(`确认清理 ${storage.orphan_count} 个孤儿预处理目录？此操作不可恢复。`)) return
+    const ok = await dialog.confirm({
+      title: '清理孤儿预处理目录',
+      message: `确认清理 ${storage.orphan_count} 个孤儿预处理目录？此操作不可恢复。`,
+      confirmText: '清理',
+      variant: 'danger',
+    })
+    if (!ok) return
     setCleaningOrphan(true)
     try {
       const res = await preprocessApi.cleanOrphanCache()
@@ -361,7 +369,13 @@ export default function PreprocessPage() {
 
   // 清理单个媒体的预处理缓存（弹窗内用）
   const handleCleanOne = useCallback(async (mediaId: string, mediaTitle: string) => {
-    if (!confirm(`确认清理「${mediaTitle || mediaId}」的预处理缓存？`)) return
+    const ok = await dialog.confirm({
+      title: '清理预处理缓存',
+      message: `确认清理「${mediaTitle || mediaId}」的预处理缓存？`,
+      confirmText: '清理',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await preprocessApi.cleanCache(mediaId)
       toastRef.current.success('已清理')
@@ -382,7 +396,13 @@ export default function PreprocessPage() {
     const tip = key === 'preprocess'
       ? `确认清空「${label}」？\n这将删除该目录下全部 ${sizeText} 内容（约等于把所有已预处理过的影视重置为「未处理」），下次播放时系统会按需重新生成。\n正在运行的预处理任务不会被中断。\n如果只想清理「数据库中已无对应任务」的孤儿目录，请展开预处理产物分类后使用「一键清理孤儿」按钮。`
       : `确认清空「${label}」？\n这将删除该目录下全部 ${sizeText} 内容，系统会在需要时自动重新生成。`
-    if (!confirm(tip)) return
+    const ok = await dialog.confirm({
+      title: `清空缓存：${label}`,
+      message: tip,
+      confirmText: '清空',
+      variant: 'danger',
+    })
+    if (!ok) return
     setCleaningCategory(key)
     try {
       const res = await preprocessApi.cleanCacheCategory(key, 'all')
@@ -410,7 +430,13 @@ export default function PreprocessPage() {
   const handleCleanAllCache = useCallback(async () => {
     if (cleaningCategory) return
     if (!cacheUsage) return
-    if (!confirm('确认一键清空所有可清理的缓存分类？\n这会清空：在线转码缓存、自适应码率缓存、缩略图/雪碧图、WebDAV 临时下载，并清理预处理的孤儿目录。\n海报/字幕/离线下载等不会被删除。此操作不可恢复。')) return
+    const ok = await dialog.confirm({
+      title: '一键清空所有缓存',
+      message: '确认一键清空所有可清理的缓存分类？\n这会清空：在线转码缓存、自适应码率缓存、缩略图/雪碧图、WebDAV 临时下载，并清理预处理的孤儿目录。\n海报/字幕/离线下载等不会被删除。此操作不可恢复。',
+      confirmText: '全部清空',
+      variant: 'danger',
+    })
+    if (!ok) return
     setCleaningCategory('__all__')
     try {
       const res = await preprocessApi.cleanAllCache()
@@ -444,7 +470,13 @@ export default function PreprocessPage() {
       toastRef.current.error('请先预览，确认有命中再提交')
       return
     }
-    if (!confirm(`确认按当前筛选条件提交 ${filterPreview.matched_count} 个预处理任务？`)) return
+    const ok = await dialog.confirm({
+      title: '提交预处理任务',
+      message: `确认按当前筛选条件提交 ${filterPreview.matched_count} 个预处理任务？`,
+      confirmText: '提交',
+      variant: 'primary',
+    })
+    if (!ok) return
     setSubmittingFilter(true)
     try {
       const res = await preprocessApi.submitByFilter(filter, 0, filterForce)

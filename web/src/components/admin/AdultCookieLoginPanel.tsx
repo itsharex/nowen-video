@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { adultScraperApi } from '@/api'
 import { Cookie, Save, TestTube2, CheckCircle2, AlertCircle, Loader2, Eye, EyeOff } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 interface SiteDef {
   id: string
@@ -60,6 +61,7 @@ const SITES: SiteDef[] = [
 type CookieMap = Record<string, string>
 
 export default function AdultCookieLoginPanel() {
+  const dialog = useDialog()
   const [cookies, setCookies] = useState<CookieMap>({})
   const [visible, setVisible] = useState<Record<string, boolean>>({})
   const [saving, setSaving] = useState(false)
@@ -99,9 +101,13 @@ export default function AdultCookieLoginPanel() {
         cookie_mgstage: cookies.mgstage,
         cookie_fc2hub: cookies.fc2hub,
       })
-      alert('✅ Cookie 已保存')
+      await dialog.alert({ title: 'Cookie 已保存', variant: 'success' })
     } catch (err: any) {
-      alert('❌ 保存失败: ' + (err?.response?.data?.error || err?.message))
+      await dialog.alert({
+        title: '保存失败',
+        message: err?.response?.data?.error || err?.message,
+        variant: 'error',
+      })
     } finally {
       setSaving(false)
     }

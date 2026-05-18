@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import type { User, UserPermission, Library } from '@/types'
 import { adminApi, libraryApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import {
   Users,
   Trash2,
@@ -37,6 +38,7 @@ interface UsersTabProps {
 
 export default function UsersTab({ users, setUsers }: UsersTabProps) {
   const toast = useToast()
+  const dialog = useDialog()
   const [libraries, setLibraries] = useState<Library[]>([])
   const [editingUser, setEditingUser] = useState<string | null>(null)
   const [, setPerm] = useState<UserPermission | null>(null)
@@ -84,7 +86,13 @@ export default function UsersTab({ users, setUsers }: UsersTabProps) {
   }, [users, keyword])
 
   const handleDeleteUser = async (id: string) => {
-    if (!confirm('确定删除此用户？')) return
+    const ok = await dialog.confirm({
+      title: '删除用户',
+      message: '确定删除此用户？',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await adminApi.deleteUser(id)
       setUsers((u) => u.filter((user) => user.id !== id))
@@ -98,7 +106,13 @@ export default function UsersTab({ users, setUsers }: UsersTabProps) {
   const handleToggleDisabled = async (user: User) => {
     const next = !user.disabled
     const actionText = next ? '禁用' : '启用'
-    if (!confirm(`确定${actionText} ${user.username}？${next ? '该用户将无法登录。' : ''}`)) return
+    const ok = await dialog.confirm({
+      title: `${actionText}用户`,
+      message: `确定${actionText} ${user.username}？${next ? '该用户将无法登录。' : ''}`,
+      confirmText: actionText,
+      variant: next ? 'warning' : 'primary',
+    })
+    if (!ok) return
     try {
       await adminApi.setUserDisabled(user.id, next)
       setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, disabled: next } : u)))

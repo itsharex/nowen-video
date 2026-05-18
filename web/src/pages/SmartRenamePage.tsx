@@ -4,6 +4,7 @@ import toast from 'react-hot-toast'
 import { smartRenameApi, type RenamePlan } from '@/api/smart_rename'
 import { pageVariants } from '@/lib/motion'
 import SmartRenamePanel, { planStatusBadge } from '@/components/SmartRenamePanel'
+import { useDialog } from '@/components/Dialog'
 
 // =============================================================
 // SmartRenamePage 智能扫描重命名（独立页）
@@ -20,6 +21,7 @@ const cardStyle: React.CSSProperties = {
 }
 
 export default function SmartRenamePage() {
+  const dialog = useDialog()
   const [planList, setPlanList] = useState<RenamePlan[]>([])
   const [planListLoading, setPlanListLoading] = useState(false)
   // 用于在选择历史规划后把它注入 Panel；通过 key 强制 Panel 重置内部状态。
@@ -59,7 +61,13 @@ export default function SmartRenamePage() {
   }
 
   async function onDeletePlan(id: string) {
-    if (!window.confirm('删除该规划记录（不影响已落盘的文件）？')) return
+    const ok = await dialog.confirm({
+      title: '删除规划记录',
+      message: '删除该规划记录（不影响已落盘的文件）？',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await smartRenameApi.deletePlan(id)
       toast.success('已删除')

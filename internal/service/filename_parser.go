@@ -101,8 +101,6 @@ var (
 		`RARBG|YTS|YIFY|PSA|EVO|DON|CtrlHD|GECKOS|SPARKS|AMIABLE|MAJESTiC|KamiKaze|KOGi|NTG|decibeL|BMF|HONE|FLUX|NOSiViD|monkee|GLHF|TRiToN|PHOENiX|CMRG|TEPES|RUSTED|playWEB|TURG|ION10|ION265|ION10|ETHEL|TOMMY|SMURF|THUGLiNE` +
 		`)$`)
 
-
-
 	// spaceSquashPattern 多空格合一
 	spaceSquashPattern = regexp.MustCompile(`\s+`)
 
@@ -216,7 +214,6 @@ func ParseMovieFilename(filename string) ParsedFilename {
 		name = next
 	}
 
-
 	// 12) 如果之前没拿到年份，再尝试常规括号年份 / 普通年份
 	if out.Year == 0 {
 		if y := extractYearFromName(name); y > 0 {
@@ -292,33 +289,83 @@ func containsHan(s string) bool {
 	return false
 }
 
-// pickFirstChineseSegment 从一串空格分隔的文本中挑出第一个包含汉字的片段（允许相邻汉字连起来）
+// pickFirstChineseSegment 提取连续的中文标题段（包含子标题）。
+//
+// 关键修复：旧版本遇到"：" / 空格 / 数字 / ASCII 等就截断，导致
+//
+//	"蜡笔小新：灼热的春日部舞者" 被截成 "蜡笔小新"，
+//
+// 进而所有蜡笔小新电影刮到同一个 TMDb 条目。
+//
+// 新策略：从第一个汉字开始扫描，遇到下列字符仍视为"标题内部"继续累积：
+//   - 中日文字符（CJK 主面 + 扩展 A）
+//   - 中文标点：："、 、 ：、·、・、-、—、—、・
+//   - ASCII 标点：':', '-', ' ', '·'
+//   - 数字与字母（如 "宝可梦XY"、"Q版三国"）
+//
+// 仅遇到明确的"段间分隔" - 多个连续空格 / 中文句点 / 制表符等，且后续不再出现汉字时，
+// 才停止累积。这样能完整保留"蜡笔小新：灼热的春日部舞者"这种带子标题的命名。
 func pickFirstChineseSegment(s string) string {
-	// 优先把紧邻的汉字串合并：用一个简单 rune 扫描
+	runes := []rune(s)
+	n := len(runes)
+
+	// 找到第一个汉字位置
+	start := -1
+	for i, r := range runes {
+		if isHanRune(r) {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+
+	// 找到最后一个汉字位置
+	end := start
+	for i := n - 1; i >= start; i-- {
+		if isHanRune(runes[i]) {
+			end = i
+			break
+		}
+	}
+
+	// 在 [start, end] 之间连续累积，但跳过明显是"段间分隔"的部分
+	//   - 连续 2 个及以上空格视为分隔（保守策略）
+	//   - 半角句点 '.' / 制表符 '\t' 视为分隔
+	// 但单个全角空格、中点 '·'、'：' 等保留为子标题分隔符
 	var buf strings.Builder
-	var result string
-	for _, r := range s {
-		isHan := (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF)
-		isPunctAttached := r == '·' || r == '・' || r == '-'
-		if isHan || (buf.Len() > 0 && isPunctAttached) {
-			buf.WriteRune(r)
+	for i := start; i <= end; i++ {
+		r := runes[i]
+		// 连续多空格视为分隔，跳过空白本身但保留之前累积
+		if r == ' ' && i+1 <= end && runes[i+1] == ' ' {
+			// 多个空格压缩为一个空格
+			buf.WriteRune(' ')
+			for i+1 <= end && runes[i+1] == ' ' {
+				i++
+			}
 			continue
 		}
-		if buf.Len() > 0 {
-			result = strings.Trim(buf.String(), "-·・")
-			if containsHan(result) {
-				return result
-			}
-			buf.Reset()
+		// 半角句点和制表符当作空格分隔
+		if r == '.' || r == '\t' {
+			buf.WriteRune(' ')
+			continue
 		}
+		buf.WriteRune(r)
 	}
-	if buf.Len() > 0 {
-		result = strings.Trim(buf.String(), "-·・")
-		if containsHan(result) {
-			return result
-		}
-	}
-	return ""
+
+	result := strings.TrimSpace(buf.String())
+	// 把全角冒号 ":" 标准化为半角冒号，便于元数据搜索（TMDb/豆瓣偏好半角）
+	result = strings.ReplaceAll(result, "：", ": ")
+	// 压缩多空格
+	result = spaceSquashPattern.ReplaceAllString(result, " ")
+	result = strings.Trim(result, " -·・:")
+	return result
+}
+
+// isHanRune 是否为 CJK 汉字（含扩展 A）
+func isHanRune(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF)
 }
 
 // pickLongestLatinSegment 从字符串中挑出最长的拉丁（英文）片段，常见于"中文名 English Title"并列

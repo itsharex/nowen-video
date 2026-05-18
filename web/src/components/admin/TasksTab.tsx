@@ -3,6 +3,7 @@ import type { TranscodeJob, ScheduledTask, Library } from '@/types'
 import type { TranscodeProgressData } from '@/hooks/useWebSocket'
 import { adminApi, libraryApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import {
   Zap,
   Loader2,
@@ -41,6 +42,7 @@ interface TasksTabProps {
 
 export default function TasksTab({ transcodeJobs, transcodeProgress }: TasksTabProps) {
   const toast = useToast()
+  const dialog = useDialog()
   const [tasks, setTasks] = useState<ScheduledTask[]>([])
   const [libraries, setLibraries] = useState<Library[]>([])
   const [loadingTasks, setLoadingTasks] = useState(true)
@@ -122,7 +124,13 @@ export default function TasksTab({ transcodeJobs, transcodeProgress }: TasksTabP
 
   // 删除任务
   const handleDelete = async (id: string) => {
-    if (!confirm('确定删除该定时任务？')) return
+    const ok = await dialog.confirm({
+      title: '删除定时任务',
+      message: '确定删除该定时任务？',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await adminApi.deleteTask(id)
       setTasks((prev) => prev.filter((t) => t.id !== id))

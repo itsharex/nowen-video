@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,12 +90,12 @@ var smartRenameUnsafeCharPattern = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 
 // SmartRenameConfig 服务级配置（来自全局 config 注入）
 type SmartRenameConfig struct {
-	DefaultStyle          string  // jellyfin / plex
-	AIConfidenceThreshold float64 // 触发 AI 阈值（默认 0.7）
-	EnableAIFallback      bool    // 是否启用 AI Fallback
-	MaxScanFiles          int     // 单次扫描最大文件数（防爆，默认 5000）
+	DefaultStyle          string   // jellyfin / plex
+	AIConfidenceThreshold float64  // 触发 AI 阈值（默认 0.7）
+	EnableAIFallback      bool     // 是否启用 AI Fallback
+	MaxScanFiles          int      // 单次扫描最大文件数（防爆，默认 5000）
 	SafeRoots             []string // 安全根目录白名单：若非空，所有改名必须在白名单内
-	RequireConfirm        bool    // 是否强制 confirm（即使前端传 false）
+	RequireConfirm        bool     // 是否强制 confirm（即使前端传 false）
 }
 
 // DefaultSmartRenameConfig 默认配置
@@ -118,13 +119,13 @@ type SmartRenameRelatedFile struct {
 
 // SmartRenameSafetyReport 安全检测结果
 type SmartRenameSafetyReport struct {
-	OK             bool     `json:"ok"`
-	CrossVolume    bool     `json:"cross_volume"`     // 跨卷
-	TargetExists   bool     `json:"target_exists"`    // 目标已存在
-	HardlinkCount  uint64   `json:"hardlink_count"`   // 硬链接数（>1 警告）
-	OutsideSafeRoot bool    `json:"outside_safe_root"`
-	NotEnoughSpace bool     `json:"not_enough_space"`
-	Issues         []string `json:"issues"` // 人类可读问题列表
+	OK              bool     `json:"ok"`
+	CrossVolume     bool     `json:"cross_volume"`   // 跨卷
+	TargetExists    bool     `json:"target_exists"`  // 目标已存在
+	HardlinkCount   uint64   `json:"hardlink_count"` // 硬链接数（>1 警告）
+	OutsideSafeRoot bool     `json:"outside_safe_root"`
+	NotEnoughSpace  bool     `json:"not_enough_space"`
+	Issues          []string `json:"issues"` // 人类可读问题列表
 }
 
 // SmartRenameAIResult AI Fallback 输出结构（强制 JSON Schema）
@@ -134,7 +135,7 @@ type SmartRenameAIResult struct {
 	Year       int     `json:"year"`
 	TMDbID     int     `json:"tmdb_id"`
 	IMDbID     string  `json:"imdb_id"`
-	MediaType  string  `json:"media_type"`  // movie / episode / unknown
+	MediaType  string  `json:"media_type"` // movie / episode / unknown
 	Season     int     `json:"season"`
 	Episode    int     `json:"episode"`
 	Confidence float64 `json:"confidence"` // AI 自评 0~1
@@ -154,10 +155,10 @@ type ScanInput struct {
 
 // ExecuteInput 执行入参
 type ExecuteInput struct {
-	PlanID    string   // 必填
-	Confirm   bool     // 必须 true 才真正落盘
-	ItemIDs   []string // 可选：仅执行指定条目（空表示全部 pending+safety_ok 条目）
-	IgnoreSafety bool  // 可选：用户显式忽略安全警告（默认 false）
+	PlanID       string   // 必填
+	Confirm      bool     // 必须 true 才真正落盘
+	ItemIDs      []string // 可选：仅执行指定条目（空表示全部 pending+safety_ok 条目）
+	IgnoreSafety bool     // 可选：用户显式忽略安全警告（默认 false）
 }
 
 // SmartRenameService 智能扫描重命名服务
@@ -169,8 +170,18 @@ type SmartRenameService struct {
 	cfg        SmartRenameConfig
 	logger     *zap.SugaredLogger
 
-	// dry-run 模拟的目标占用集合，避免同一规划内两个条目目标冲突
-	mu sync.Mutex
+	// preloadedMedia 在单次 Scan 期间临时缓存的"路径→Media"映射；
+	// buildItem 内部仅读，外部由 Scan 在每次调用前/后重新设置/清理。
+	// 因 Scan 内部使用 errgroup 串行启动+等待，所以无需读写锁。
+	preloadedMedia map[string]*model.Media
+
+	// seriesAICache 番剧主干级 AI 结果缓存（生命周期随 Scan）。
+	// key 由 seriesFingerprint(srcName, parentDir) 决定，保证同一番剧的不同集
+	// 共用同一份 AI 调用结果，避免一集 1 次请求导致的 429 / 配额浪费。
+	//
+	// AI 命中时调用方仅根据当前文件再算一次集号即可，剧名/年份/TMDb 全部复用。
+	seriesAICache   map[string]*SmartRenameAIResult
+	seriesAICacheMu sync.Mutex
 }
 
 // NewSmartRenameService 构造服务
@@ -266,30 +277,41 @@ func (s *SmartRenameService) Scan(in ScanInput) (*model.RenamePlan, error) {
 		return nil, fmt.Errorf("持久化规划失败: %w", err)
 	}
 
-	// 3) 逐个识别 + 生成条目
-	items := make([]model.RenamePlanItem, 0, len(videoFiles))
-	usedTargets := map[string]bool{}
+	// 3) 预加载：一次 SQL 拉全部 file_path→Media 映射，避免循环内 N+1。
+	mediaMap := s.preloadMediaMap(videoFiles)
+
+	// 3.5) 初始化"番剧主干 AI 缓存"，本次 Scan 期间共享，结束清理。
+	//      作用：同一番剧的多集只调用一次 AI，节省配额并规避 429 限流。
+	s.seriesAICacheMu.Lock()
+	s.seriesAICache = make(map[string]*SmartRenameAIResult)
+	s.seriesAICacheMu.Unlock()
+	defer func() {
+		s.seriesAICacheMu.Lock()
+		s.seriesAICache = nil
+		s.seriesAICacheMu.Unlock()
+	}()
+
+	// 3.6) 主动批量预热番剧主干 AI 缓存（C 阶段增强）：
+	//      在 buildItemsParallel 启动之前，按番剧主干分组，对"每组 ≥ 2 个文件"
+	//      的目录主动调用一次 AI 批量识别，结果回填到 seriesAICache。
+	//      这样后续逐文件 build 时就直接走缓存，单组 N 集只产生 1 次 AI 调用。
+	if enableAI && s.ai != nil && s.ai.IsEnabled() {
+		s.prewarmSeriesAICache(videoFiles, mediaMap, threshold)
+	}
+
+	// 4) 并发识别 + 生成条目
+	items := s.buildItemsParallel(planID, videoFiles, style, in.Template, enableAI, threshold, safeRoots, mediaMap)
+
+	// 5) 统计汇总
 	stats := struct {
 		need, skipped, unsafe, ai int
 	}{}
-
-	for _, src := range videoFiles {
-		item, err := s.buildItem(planID, src, style, in.Template, enableAI, threshold, safeRoots, usedTargets)
-		if err != nil {
-			s.logger.Warnf("[SmartRename] 生成条目失败 file=%s: %v", src, err)
-			item = &model.RenamePlanItem{
-				ID:         uuid.New().String(),
-				PlanID:     planID,
-				SourcePath: src,
-				SourceName: filepath.Base(src),
-				Status:     model.RenameItemStatusFailed,
-				ErrorMsg:   err.Error(),
-			}
-		}
-		if item.AIInvoked {
+	for i := range items {
+		it := &items[i]
+		if it.AIInvoked {
 			stats.ai++
 		}
-		switch item.Status {
+		switch it.Status {
 		case model.RenameItemStatusPending:
 			stats.need++
 		case model.RenameItemStatusSkipped:
@@ -297,7 +319,6 @@ func (s *SmartRenameService) Scan(in ScanInput) (*model.RenamePlan, error) {
 		case model.RenameItemStatusUnsafe:
 			stats.unsafe++
 		}
-		items = append(items, *item)
 	}
 
 	if err := s.repo.CreateItems(items); err != nil {
@@ -323,9 +344,14 @@ func (s *SmartRenameService) Scan(in ScanInput) (*model.RenamePlan, error) {
 }
 
 // collectVideoFiles 递归扫描目录，仅收集视频文件
+//
+// 加速优化：
+//   - 跳过小于 10MB 的文件：片头/广告/样片/损坏文件，避免浪费 AI 调用 + 后续磁盘 IO；
+//   - .strm 远程流文件 大小不代表内容，豁免大小过滤。
 func (s *SmartRenameService) collectVideoFiles(root string) ([]string, error) {
 	var files []string
 	maxFiles := s.cfg.MaxScanFiles
+	const minVideoBytes = 10 * 1024 * 1024 // 10MB
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			s.logger.Warnf("[SmartRename] 跳过不可访问路径 %s: %v", p, err)
@@ -342,6 +368,12 @@ func (s *SmartRenameService) collectVideoFiles(root string) ([]string, error) {
 		ext := strings.ToLower(filepath.Ext(p))
 		if !smartRenameVideoExts[ext] {
 			return nil
+		}
+		// 小文件过滤（.strm 远程流豁免）
+		if ext != ".strm" {
+			if info, e := d.Info(); e == nil && info.Size() < minVideoBytes {
+				return nil
+			}
 		}
 		files = append(files, p)
 		if maxFiles > 0 && len(files) >= maxFiles {
@@ -378,7 +410,13 @@ func (s *SmartRenameService) buildItem(
 	conf := s.scoreConfidence(parsed)
 
 	// === 关联落库的 Media (若有)：优先用 DB 信息覆盖 ===
-	mediaInfo, _ := s.lookupMediaByPath(src)
+	// 优先从预加载 map 取；未传则兑底 SQL。
+	var mediaInfo *model.Media
+	if s.preloadedMedia != nil {
+		mediaInfo = s.preloadedMedia[src]
+	} else {
+		mediaInfo, _ = s.lookupMediaByPath(src)
+	}
 	if mediaInfo != nil {
 		item.MediaID = mediaInfo.ID
 		// 用 DB 中的精确字段强化识别
@@ -412,9 +450,52 @@ func (s *SmartRenameService) buildItem(
 	if enableAI && conf < aiThreshold && s.ai != nil && s.ai.IsEnabled() {
 		// 把父目录名也传给 AI，增加识别上下文（如文件名不含标题但目录名包含剧名）
 		parentDir := filepath.Base(filepath.Dir(src))
-		aiRes, aiRaw, aiErr := s.callAIFallback(srcName, parentDir, parsed)
+
+		// === 番剧主干缓存：相同剧的不同集复用 ===
+		// 例如 `Ladies versus Butlers - 02/03/04...` 共用一次 AI 结果，
+		// 仅替换集号；显著降低 AI 调用量，规避 429 限流。
+		fp := s.seriesFingerprint(srcName, parentDir)
+		var aiRes *SmartRenameAIResult
+		var aiRaw string
+		var aiErr error
+		var fromSeriesCache bool
+		if fp != "" {
+			s.seriesAICacheMu.Lock()
+			if cached, ok := s.seriesAICache[fp]; ok && cached != nil {
+				// 深拷贝缓存条目，避免被本条目的集号修改污染其他文件
+				cp := *cached
+				aiRes = &cp
+				aiRaw = "(reused from series cache)"
+				fromSeriesCache = true
+			}
+			s.seriesAICacheMu.Unlock()
+		}
+
+		if !fromSeriesCache {
+			aiRes, aiRaw, aiErr = s.callAIFallback(srcName, parentDir, parsed)
+			// 命中成功后写回番剧主干缓存
+			if aiErr == nil && aiRes != nil && fp != "" {
+				cp := *aiRes
+				s.seriesAICacheMu.Lock()
+				s.seriesAICache[fp] = &cp
+				s.seriesAICacheMu.Unlock()
+			}
+		}
 		item.AIInvoked = true
 		item.AIRawResponse = aiRaw
+
+		// 共用缓存场景下，集号必须按当前文件名重新解析（缓存里的是别的文件的集号）
+		if fromSeriesCache && aiRes != nil {
+			if se, ep := extractSxxExx(srcName); se > 0 && ep > 0 {
+				aiRes.Season = se
+				aiRes.Episode = ep
+			} else if ep := extractEpisodeNumber(srcName); ep > 0 {
+				if aiRes.Season <= 0 {
+					aiRes.Season = 1
+				}
+				aiRes.Episode = ep
+			}
+		}
 		if aiErr == nil && aiRes != nil {
 			// AI 置信度高于规则时，完全采纳 AI 结果
 			if aiRes.Confidence >= conf {
@@ -534,9 +615,9 @@ func (s *SmartRenameService) buildItem(
 		item.SafetyNote = strings.Join(safety.Issues, "; ")
 		item.Status = model.RenameItemStatusUnsafe
 	} else {
-		// 标记目标已占用
+		// 标记目标已占用（跨平台大小写策略由 pathKey 决定）
 		for _, t := range allTargets {
-			usedTargets[strings.ToLower(t)] = true
+			usedTargets[pathKey(t)] = true
 		}
 	}
 
@@ -574,28 +655,156 @@ func (s *SmartRenameService) scoreConfidence(p ParsedFilename) float64 {
 	return score
 }
 
-// lookupMediaByPath 用源路径反查 Media（不强求一定能查到）
+// preloadMediaMap 一次 SQL 把所有候选源路径对应的 Media 拉出来，回写到 s.preloadedMedia。
+//
+// 任何失败都不会阻断流程：返回 nil/空 map 时，buildItem 会自动回退到逐条 SQL 查询。
+func (s *SmartRenameService) preloadMediaMap(paths []string) map[string]*model.Media {
+	if s.mediaRepo == nil || len(paths) == 0 {
+		return nil
+	}
+	m, err := s.mediaRepo.ListByFilePaths(paths)
+	if err != nil {
+		s.logger.Warnf("[SmartRename] 预加载 Media 失败（回退到逐条查询）: %v", err)
+		return nil
+	}
+	return m
+}
+
+// buildItemsParallel 并发执行 buildItem。
+//
+// 关键点：
+//   - 并发数 = min(8, NumCPU*2)，AI 可用时再被 AIService.semaphore 收紧到全局并发上限；
+//   - usedTargets 是"目标路径占用表"（防止两个源解析到相同目标），并发下用 mu 保护；
+//   - 结果 items 与 paths 顺序一一对应（用 index 写回，避免 channel 乱序）。
+func (s *SmartRenameService) buildItemsParallel(
+	planID string,
+	paths []string,
+	style, customTpl string,
+	enableAI bool, aiThreshold float64,
+	safeRoots []string,
+	preloaded map[string]*model.Media,
+) []model.RenamePlanItem {
+	// 临时把预加载 map 注入服务，buildItem 直接读
+	s.preloadedMedia = preloaded
+	defer func() { s.preloadedMedia = nil }()
+
+	items := make([]model.RenamePlanItem, len(paths))
+
+	// 并发参数
+	workers := runtime.NumCPU() * 2
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 8 {
+		workers = 8
+	}
+
+	var (
+		mu          sync.Mutex
+		usedTargets = map[string]bool{}
+		wg          sync.WaitGroup
+	)
+
+	jobs := make(chan int, len(paths))
+
+	worker := func() {
+		defer wg.Done()
+		// 每个 goroutine 用独立的 localUsed，避免每条都抢全局锁；
+		// 完成后一次性合并到 usedTargets。
+		// 但 SafetyCheck 里的 usedTargets 检测必须看到全局视图，
+		// 所以这里仍要传共享 map + 加锁。简化：直接共享 + 锁。
+		for i := range jobs {
+			src := paths[i]
+			item, err := s.buildItemSafe(planID, src, style, customTpl, enableAI, aiThreshold, safeRoots, &mu, usedTargets)
+			if err != nil {
+				items[i] = model.RenamePlanItem{
+					ID:         uuid.New().String(),
+					PlanID:     planID,
+					SourcePath: src,
+					SourceName: filepath.Base(src),
+					Status:     model.RenameItemStatusFailed,
+					ErrorMsg:   err.Error(),
+				}
+				continue
+			}
+			items[i] = *item
+		}
+	}
+
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go worker()
+	}
+	for i := range paths {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return items
+}
+
+// buildItemSafe 是 buildItem 的并发安全包装：替换原先直接传 usedTargets map 的方式，
+// 由调用方持有锁；内部 buildItem 仍假设 usedTargets 是它独占的临时副本视图。
+//
+// 实现：在持锁状态下做"读快照 + 调用 buildItem + 合并写回"，保证目标占用判定一致。
+func (s *SmartRenameService) buildItemSafe(
+	planID, src, style, customTpl string,
+	enableAI bool, aiThreshold float64,
+	safeRoots []string,
+	mu *sync.Mutex,
+	usedTargets map[string]bool,
+) (*model.RenamePlanItem, error) {
+	// 复制一份 used 快照供 buildItem 检测（buildItem 只在内部 markUsed 时往里塞）
+	mu.Lock()
+	snapshot := make(map[string]bool, len(usedTargets))
+	for k, v := range usedTargets {
+		snapshot[k] = v
+	}
+	mu.Unlock()
+
+	item, err := s.buildItem(planID, src, style, customTpl, enableAI, aiThreshold, safeRoots, snapshot)
+	if err != nil {
+		return nil, err
+	}
+
+	// 把 snapshot 中新增的目标占用合并回全局
+	mu.Lock()
+	for k := range snapshot {
+		usedTargets[k] = true
+	}
+	mu.Unlock()
+
+	return item, nil
+}
+
+// lookupMediaByPath 用源路径反查 Media（不强求一定能查到）。
+//
+// 之前使用 ListFilesAdvanced(keyword=src) 进行 LIKE %src% 模糊查询：
+//   - 路径中的 `_` / `%` 会被 LIKE 当作通配符，造成误匹配；
+//   - LIMIT 1 + ORDER BY created_at DESC 不一定是精确匹配者，造成漏命中。
+//
+// 现改用 MediaRepo.FindByFilePath 进行 file_path = ? 精确查询。
 func (s *SmartRenameService) lookupMediaByPath(src string) (*model.Media, error) {
 	if s.mediaRepo == nil {
 		return nil, nil
 	}
-	// repo_media.go 没有公开的 ByPath；用底层 DB 查询
-	// 这里通过 ListFilesAdvanced 不合适，直接以 FilePath 精确匹配
-	// 为了不强依赖额外方法，采用 keyword 兜底
-	// （后续可在 MediaRepo 加一个 GetByFilePath 优化）
-	media, _, err := s.mediaRepo.ListFilesAdvanced(1, 1, "", "", src, "", "", nil)
-	if err != nil || len(media) == 0 {
+	m, err := s.mediaRepo.FindByFilePath(src)
+	if err != nil {
+		if repository.IsNotFound(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	if media[0].FilePath == src {
-		return &media[0], nil
-	}
-	return nil, nil
+	return m, nil
 }
 
-// extractSxxExx 从字符串中找出 SxxExx 集数
+// extractSxxExx 从字符串中找出 SxxExx 集数。
+//
+// 之前使用 \b（word boundary）作为边界，但 Go 正则中 `_` 是 word char，
+// 造成 `something_S01E01_other` 这类常见命名不能匹配。
+// 现改用"非字母数字/起始结束"作为显式边界，同时接受 _/-/. /空格 作为可选分隔。
 func extractSxxExx(s string) (int, int) {
-	re := regexp.MustCompile(`(?i)\bS(\d{1,3})[\.\s]?E(\d{1,3})\b`)
+	re := regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])S(\d{1,3})[._\s\-]?E(\d{1,3})(?:[^A-Za-z0-9]|$)`)
 	m := re.FindStringSubmatch(s)
 	if len(m) < 3 {
 		return 0, 0
@@ -603,6 +812,67 @@ func extractSxxExx(s string) (int, int) {
 	se, _ := strconv.Atoi(m[1])
 	ep, _ := strconv.Atoi(m[2])
 	return se, ep
+}
+
+// extractEpisodeNumber 仅识别"独立集号"（无 SxxExx 时的备选）。
+//
+// 覆盖国内动漫资源常见命名：
+//   - "[ANi] XXX - 02 [1080P]..."
+//   - "XXX 第08话 / EP08 / [08]"
+//   - "Some Show 12.mkv"
+//
+// 仅返回正整数集号；返回 0 表示未识别。
+func extractEpisodeNumber(s string) int {
+	// 去扩展名
+	stem := strings.TrimSuffix(s, filepath.Ext(s))
+	patterns := []*regexp.Regexp{
+		// 显式中/英集号关键词
+		regexp.MustCompile(`(?i)(?:^|[\s\-_\[【])(?:EP|E|第)\s*0*(\d{1,4})\s*(?:话|集|话\b|集\b|话|集|\b|[\]\s\-_）】])`),
+		// "title - 02 [..." 这种空格-数字-空格段（动漫主流命名）
+		regexp.MustCompile(`(?:^|\s|\-)\s*\-\s*0*(\d{1,4})\s*(?:[\[\(\s]|$)`),
+		// "[12]" 单独括号集号
+		regexp.MustCompile(`[\[【]\s*0*(\d{1,4})\s*[\]】]`),
+	}
+	for _, re := range patterns {
+		m := re.FindStringSubmatch(stem)
+		if len(m) >= 2 {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && n < 2000 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// seriesFingerprint 计算"番剧主干"指纹，用于在一次 Scan 期间复用 AI 结果。
+//
+// 核心思路：剥离一切随集变化的部分（集号 / 季号 / 单独数字段），
+// 保留发布组、剧名主体、年份、来源标签等"对所有集都相同"的内容作为指纹。
+//
+// 同主干 + 同父目录视为同一番剧；仅命中其中一集需要 AI 时，其余集全部走缓存。
+//
+// 返回 "" 表示无法稳定提取（保守起见此时不复用缓存，仍逐文件调 AI）。
+func (s *SmartRenameService) seriesFingerprint(srcName, parentDir string) string {
+	stem := strings.TrimSuffix(srcName, filepath.Ext(srcName))
+	work := stem
+
+	// 1) 去 SxxExx
+	work = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])S\d{1,3}[._\s\-]?E\d{1,3}`).ReplaceAllString(work, " ")
+	// 2) 去显式集号关键词（EP08 / 第08话 / 第08集）
+	work = regexp.MustCompile(`(?i)(?:EP|E|第)\s*0*\d{1,4}\s*(?:话|集)?`).ReplaceAllString(work, " ")
+	// 3) 去 " - 02 " / " - 003 " 这种动漫常见集号段
+	work = regexp.MustCompile(`(?:\s|\-|_)\-?\s*0*\d{1,4}\s*(?:[\[\(]|$)`).ReplaceAllString(work, " ")
+	// 4) 去 [12] / 【08】 单独括号集号
+	work = regexp.MustCompile(`[\[【]\s*0*\d{1,4}\s*[\]】]`).ReplaceAllString(work, " ")
+	// 5) 折叠空白
+	work = collapseWhitespace(work)
+
+	// 至少要剩下若干字符才有"主干"意义；过短则放弃复用，回退到逐条 AI
+	if len([]rune(work)) < 4 {
+		return ""
+	}
+	// 用父目录名 + 处理后主干 一起作为缓存 key（避免不同剧凑巧主干相同）
+	return strings.ToLower(parentDir + "||" + work)
 }
 
 // ================================ P1: AI Fallback ============================
@@ -639,10 +909,30 @@ func (s *SmartRenameService) callAIFallback(srcName, parentDir string, hint Pars
 请按 JSON Schema 返回最终识别结果。`,
 		srcName, parentDir, hint.Title, hint.TitleAlt, hint.Year, hint.TMDbID, hint.IMDbID)
 
+	// === 二级缓存：相同 (sysPrompt, userPrompt) 直接命中 ===
+	// 同一来源目录下大量同名／模式高度相似的文件名是重灾区，
+	// 命中后直接节省一次 LLM 往返（≈1~3s + token 费）。
+	cacheKey := "smart_rename_v1:" + srcName + "|" + parentDir + "|" +
+		fmt.Sprintf("%s|%s|%d|%d|%s", hint.Title, hint.TitleAlt, hint.Year, hint.TMDbID, hint.IMDbID)
+	if cached, ok := s.ai.GetCache(cacheKey); ok && cached != "" {
+		cleaned := stripJSONFence(cached)
+		var out SmartRenameAIResult
+		if err := json.Unmarshal([]byte(cleaned), &out); err == nil {
+			if out.Confidence <= 0 || out.Confidence > 1 {
+				out.Confidence = 0.5
+			}
+			return &out, cached, nil
+		}
+		// JSON 损坏的缓存就当未命中
+	}
+
 	raw, err := s.ai.ChatCompletion(sysPrompt, userPrompt, 0.2, 512)
 	if err != nil {
 		return nil, "", err
 	}
+
+	// 写缓存（无论解析是否成功都写一份原始 raw，下次至少省掉网络）
+	s.ai.SetCache(cacheKey, raw)
 
 	// 清洗：模型可能仍然带 ```json fence
 	cleaned := stripJSONFence(raw)
@@ -656,19 +946,200 @@ func (s *SmartRenameService) callAIFallback(srcName, parentDir string, hint Pars
 	return &out, raw, nil
 }
 
-// stripJSONFence 剥离 Markdown 代码围栏
+// prewarmSeriesAICache 按番剧主干分组，对组内 ≥ 2 个文件的目录主动调用一次 AI 批量识别，
+// 结果填入 s.seriesAICache，让后续 buildItem 走缓存。
+//
+// 跳过条件：
+//   - 已在 mediaMap 中（DB 已识别，置信度 0.99 不会触发 AI）
+//   - 规则解析已经达到 aiThreshold（无需 AI）
+//   - 单文件分组（没有"批量节省"价值，留给 buildItem 单独处理）
+//
+// 失败回退：批量 AI 调用失败/解析失败时，缓存留空 → 后续每文件仍会单独走 AI Fallback
+// （那时 B 阶段的"首次成功后回填缓存"机制会接管，最终也只浪费 1 次额外调用）。
+func (s *SmartRenameService) prewarmSeriesAICache(
+	paths []string,
+	mediaMap map[string]*model.Media,
+	aiThreshold float64,
+) {
+	if len(paths) == 0 || s.ai == nil || !s.ai.IsEnabled() {
+		return
+	}
+
+	groups := map[string]*seriesPrewarmGroup{}
+
+	for _, src := range paths {
+		// DB 已识别 → 跳过
+		if mediaMap != nil {
+			if m, ok := mediaMap[src]; ok && m != nil && m.TMDbID > 0 {
+				continue
+			}
+		}
+		name := filepath.Base(src)
+		parentDir := filepath.Base(filepath.Dir(src))
+		fp := s.seriesFingerprint(name, parentDir)
+		if fp == "" {
+			continue
+		}
+		// 规则置信度已达标的不参与（不会触发 AI Fallback）
+		parsed := ParseMovieFilename(name)
+		if s.scoreConfidence(parsed) >= aiThreshold {
+			continue
+		}
+
+		if g, ok := groups[fp]; ok {
+			if len(g.samples) < 6 { // 最多采 6 个样本，控制 prompt 长度
+				g.samples = append(g.samples, name)
+			}
+		} else {
+			groups[fp] = &seriesPrewarmGroup{
+				fp:        fp,
+				parentDir: parentDir,
+				samples:   []string{name},
+				hint:      parsed,
+			}
+		}
+	}
+
+	// 仅对 ≥ 2 个文件的组做批量预热，单文件组留给 buildItem
+	work := make([]*seriesPrewarmGroup, 0, len(groups))
+	totalSamples := 0
+	for _, g := range groups {
+		if len(g.samples) >= 2 {
+			work = append(work, g)
+			totalSamples += len(g.samples)
+		}
+	}
+	if len(work) == 0 {
+		return
+	}
+
+	s.logger.Infof("[SmartRename] 番剧批量预热：%d 组 / 总样本 %d 个", len(work), totalSamples)
+
+	// 串行执行（AI 内部已有并发控制 + 限流；这里再加并发反而易触发 429）
+	hits := 0
+	for _, g := range work {
+		res, err := s.callAIBatchSeries(g.parentDir, g.samples, g.hint)
+		if err != nil {
+			s.logger.Debugf("[SmartRename] 批量预热失败 fp=%s: %v", g.fp, err)
+			continue
+		}
+		if res == nil {
+			continue
+		}
+		s.seriesAICacheMu.Lock()
+		s.seriesAICache[g.fp] = res
+		s.seriesAICacheMu.Unlock()
+		hits++
+	}
+	// 节省次数估算：每命中 1 组 = 节省 (samples-1) 次后续 AI 调用
+	saved := 0
+	if hits > 0 {
+		for _, g := range work {
+			saved += len(g.samples) - 1
+		}
+	}
+	s.logger.Infof("[SmartRename] 番剧批量预热完成：成功 %d / %d 组（预计节省约 %d 次 AI 调用）",
+		hits, len(work), saved)
+}
+
+// seriesPrewarmGroup 表示批量预热时一组同番剧的待识别集合
+type seriesPrewarmGroup struct {
+	fp        string
+	parentDir string
+	samples   []string
+	hint      ParsedFilename
+}
+
+// callAIBatchSeries 批量识别一组同番剧文件名。
+//
+// Prompt 中传入多份文件名 + 父目录上下文，让 AI 识别"这一组属于同一部什么剧"，
+// 返回该剧的 Title / TitleAlt / Year / TMDb / IMDb / MediaType；
+// 集号字段（season/episode）由调用方在使用时按各自文件名重新解析。
+//
+// 缓存：同一 (parentDir + 排序后样本指纹) 命中 AIService 双层缓存，避免重复扫描时重新调用。
+func (s *SmartRenameService) callAIBatchSeries(parentDir string, samples []string, hint ParsedFilename) (*SmartRenameAIResult, error) {
+	if len(samples) == 0 {
+		return nil, errors.New("samples 为空")
+	}
+	// 排序使 cache key 稳定
+	sorted := make([]string, len(samples))
+	copy(sorted, samples)
+	sort.Strings(sorted)
+
+	cacheKey := "smart_rename_batch_v1:" + parentDir + "||" + strings.Join(sorted, "##")
+	if cached, ok := s.ai.GetCache(cacheKey); ok && cached != "" {
+		var out SmartRenameAIResult
+		if err := json.Unmarshal([]byte(stripJSONFence(cached)), &out); err == nil {
+			if out.Confidence <= 0 || out.Confidence > 1 {
+				out.Confidence = 0.5
+			}
+			return &out, nil
+		}
+	}
+
+	sysPrompt := `你是影视命名识别专家。下面给出"同一部影视作品的多个文件名"（通常是同一番剧的不同集、或同一电影的多个版本/光盘）。
+请综合多份样本识别出"作品本身"的元数据。
+
+严格按以下 JSON Schema 返回，不要任何额外解释、不要 Markdown 代码块：
+{
+  "title": "中文主标题（无则填英文/原始）",
+  "title_alt": "英文别名（可空）",
+  "year": 1999,
+  "tmdb_id": 0,
+  "imdb_id": "tt1234567（可空）",
+  "media_type": "movie|episode|unknown",
+  "season": 0,
+  "episode": 0,
+  "confidence": 0.85
+}
+
+约束：
+- 仅识别已知影视作品，不要编造；不确定的字段留空 / 0 / unknown。
+- 输入是同一作品的多份样本，请输出该"作品"的元数据，而不是某一集；
+- 集号 season/episode 在批量场景下意义不大，可填 0；调用方会单独解析每个文件的集号。
+- confidence 取 0.0~1.0；样本之间高度一致 + 命名清晰可给 0.85+。`
+
+	var sb strings.Builder
+	sb.WriteString("所在目录：")
+	sb.WriteString(parentDir)
+	sb.WriteString("\n样本文件名（同一部作品）：\n")
+	for i, name := range sorted {
+		sb.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, name))
+	}
+	sb.WriteString(fmt.Sprintf("当前规则解析（参考，可能不准）：title=%q title_alt=%q year=%d tmdb=%d imdb=%q\n",
+		hint.Title, hint.TitleAlt, hint.Year, hint.TMDbID, hint.IMDbID))
+	sb.WriteString("请按 JSON Schema 返回最终识别结果。")
+
+	raw, err := s.ai.ChatCompletion(sysPrompt, sb.String(), 0.2, 512)
+	if err != nil {
+		return nil, err
+	}
+	s.ai.SetCache(cacheKey, raw)
+
+	var out SmartRenameAIResult
+	if err := json.Unmarshal([]byte(stripJSONFence(raw)), &out); err != nil {
+		return nil, fmt.Errorf("AI 批量响应 JSON 解析失败: %w", err)
+	}
+	if out.Confidence <= 0 || out.Confidence > 1 {
+		out.Confidence = 0.5
+	}
+	return &out, nil
+}
+
+// stripJSONFence 剥离 Markdown 代码围栏。
+//
+// 返回“首个 `{` 到最后一个 `}` 之间”的 JSON 主体，
+// 避免代码围栏 / 引导说明多余输出干扰后续 Unmarshal。
 func stripJSONFence(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	// 去除前导非 { 字符（模型可能加额外引导词）
-	if idx := strings.Index(s, "{"); idx > 0 {
-		s = s[idx:]
-	}
-	if idx := strings.LastIndex(s, "}"); idx >= 0 && idx < len(s)-1 {
-		s = s[:idx+1]
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end >= start {
+		return s[start : end+1]
 	}
 	return s
 }
@@ -752,6 +1223,23 @@ func renderIDTag(style string, tmdbID int, imdbID string) string {
 		}
 		return fmt.Sprintf(" [imdbid-%s]", imdbID)
 	}
+}
+
+// pathKey 返回一个能用于"同一规划内目标占用集合"的路径键。
+//
+// Windows / macOS 默认不区分大小写，这里走 ToLower；Linux 区分大小写，保留原值。
+// 统一走 filepath.Clean，避免例如 `a//b` vs `a/b` 不一致。
+func pathKey(p string) string {
+	p = filepath.Clean(p)
+	if runtime.GOOS == "linux" {
+		return p
+	}
+	return strings.ToLower(p)
+}
+
+// pathEqual 判定两个路径是否指向同一位置（考虑平台大小写 + Clean）。
+func pathEqual(a, b string) bool {
+	return pathKey(a) == pathKey(b)
 }
 
 // sanitizeTitle 标题中的 NTFS/ext4 禁用字符替换为空格
@@ -847,7 +1335,7 @@ func (s *SmartRenameService) checkSafety(src, tgt string, allTargets, safeRoots 
 
 	// 2) 目标已存在
 	for _, t := range allTargets {
-		if t == src {
+		if pathEqual(t, src) {
 			continue
 		}
 		if _, err := os.Stat(t); err == nil {
@@ -856,7 +1344,7 @@ func (s *SmartRenameService) checkSafety(src, tgt string, allTargets, safeRoots 
 			break
 		}
 		// 同一规划中目标已被占用
-		if usedTargets[strings.ToLower(t)] {
+		if usedTargets[pathKey(t)] {
 			report.TargetExists = true
 			report.Issues = append(report.Issues, "目标与同一规划内其他条目冲突: "+filepath.Base(t))
 			break
@@ -1065,9 +1553,9 @@ func (s *SmartRenameService) UpdateItemOverride(itemID, overrideName string, exc
 	return s.repo.GetItem(itemID)
 }
 
-// ListPlans 列出
-func (s *SmartRenameService) ListPlans(page, size int) ([]model.RenamePlan, int64, error) {
-	return s.repo.ListPlans(page, size)
+// ListPlans 列出规划（可按 LibraryID 过滤）
+func (s *SmartRenameService) ListPlans(page, size int, libraryID string) ([]model.RenamePlan, int64, error) {
+	return s.repo.ListPlansFiltered(libraryID, page, size)
 }
 
 // GetPlan 取详情

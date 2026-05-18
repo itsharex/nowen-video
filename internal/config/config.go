@@ -675,8 +675,10 @@ func setDefaults() {
 	viper.SetDefault("ai.enable_metadata_enhance", true)
 	viper.SetDefault("ai.monthly_budget", 0)
 	viper.SetDefault("ai.cache_ttl_hours", 168)
-	viper.SetDefault("ai.max_concurrent", 3)
-	viper.SetDefault("ai.request_interval_ms", 200)
+	// 默认偏保守：单并发 + 1.1s 间隔，对齐主流云端 LLM 服务（OpenAI/阿里云百炼/DeepSeek）
+	// 免费档 60 QPM 上限，避免 429。用户可在前端 AI 高级设置里手动调高。
+	viper.SetDefault("ai.max_concurrent", 1)
+	viper.SetDefault("ai.request_interval_ms", 1100)
 
 	// ---- 字幕预处理（ASR/OCR/清洗）默认值 ----
 	viper.SetDefault("ai.subtitle_preprocess_workers", 1)

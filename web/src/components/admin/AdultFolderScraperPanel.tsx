@@ -22,6 +22,7 @@ import {
   Home,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 // --- 文件夹浏览器（复用后端 /admin/fs/browse） ---
 interface FsBrowseItem {
@@ -36,6 +37,7 @@ interface FsBrowseResp {
 }
 
 export default function AdultFolderScraperPanel() {
+  const dialog = useDialog()
   // 文件夹浏览 state
   const [browseCur, setBrowseCur] = useState<string>('/')
   const [browseParent, setBrowseParent] = useState<string>('')
@@ -91,7 +93,7 @@ export default function AdultFolderScraperPanel() {
       const res = await adultScraperApi.scanFolder(path, recursive, maxDepth)
       setScanResult(res.data.data)
     } catch (err: any) {
-      alert('扫描失败: ' + (err?.response?.data?.error || err?.message))
+      await dialog.alert({ title: '扫描失败', message: err?.response?.data?.error || err?.message, variant: 'error' })
     } finally {
       setScanLoading(false)
     }
@@ -139,7 +141,7 @@ export default function AdultFolderScraperPanel() {
 
   const handleStart = async () => {
     if (selected.size === 0) {
-      alert('请至少选择一个视频')
+      await dialog.alert({ title: '未选择视频', message: '请至少选择一个视频', variant: 'warning' })
       return
     }
     setStarting(true)
@@ -153,7 +155,7 @@ export default function AdultFolderScraperPanel() {
       await loadTasks()
       setSelected(new Set())
     } catch (err: any) {
-      alert('启动失败: ' + (err?.response?.data?.error || err?.message))
+      await dialog.alert({ title: '启动失败', message: err?.response?.data?.error || err?.message, variant: 'error' })
     } finally {
       setStarting(false)
     }

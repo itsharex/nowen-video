@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import type { Media, Library, FileManagerStats, FolderNode } from '@/types'
 import { fileManagerApi, libraryApi } from '@/api'
 import { useToast } from '@/components/Toast'
+import { useDialog } from '@/components/Dialog'
 import AIAssistant, { AIAssistantButton, AIAssistantPanel } from '@/components/AIAssistant'
 import ScrapeManagerPage from '@/pages/ScrapeManagerPage'
 import AdultScraperSection from '@/components/admin/AdultScraperTab'
@@ -42,6 +43,7 @@ type FolderDialogType = 'none' | 'createFolder' | 'renameFolder' | 'deleteFolder
 
 export default function FileManagerPage() {
   const toast = useToast()
+  const dialog = useDialog()
   const { on, off } = useWebSocket()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -238,7 +240,13 @@ export default function FileManagerPage() {
   // ==================== 操作 ====================
 
   const handleDeleteFile = async (id: string) => {
-    if (!confirm('确定要删除此文件记录吗？（原始文件不会被删除）')) return
+    const ok = await dialog.confirm({
+      title: '删除文件记录',
+      message: '确定要删除此文件记录吗？（原始文件不会被删除）',
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await fileManagerApi.deleteFile(id)
       toast.success('文件记录已删除')
@@ -251,7 +259,13 @@ export default function FileManagerPage() {
 
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) return
-    if (!confirm(`确定要删除选中的 ${selectedIds.size} 个文件记录吗？（原始文件不会被删除）`)) return
+    const ok = await dialog.confirm({
+      title: '批量删除文件记录',
+      message: `确定要删除选中的 ${selectedIds.size} 个文件记录吗？（原始文件不会被删除）`,
+      confirmText: '删除',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       const res = await fileManagerApi.batchDeleteFiles(Array.from(selectedIds))
       toast.success(`已删除 ${res.data.deleted} 个文件记录`)

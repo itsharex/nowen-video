@@ -1039,6 +1039,7 @@ func (s *MetadataService) bestMatchResult(results []TMDbMovie, searchTitle strin
 		}
 
 		// 年份匹配 → +30 分（精确）或 +15 分（相差 1 年）
+		// 年份冲突 → -100 分（差距 ≥ 2 年时硬性降权，避免热门同名条目串到所有年份）
 		if year > 0 {
 			dateStr := r.ReleaseDate
 			if dateStr == "" {
@@ -1050,6 +1051,10 @@ func (s *MetadataService) bestMatchResult(results []TMDbMovie, searchTitle strin
 					score += 30
 				} else if resultYear > 0 && absInt(resultYear-year) == 1 {
 					score += 15
+				} else if resultYear > 0 && absInt(resultYear-year) >= 2 {
+					// 年份明显不符：例如用户指定 1995，但候选条目是 2025
+					// 必须重罚，避免"蜡笔小新"同名系列里全部命中最热门的 2025 新片
+					score -= 100
 				}
 			}
 		}

@@ -229,6 +229,7 @@ func main() {
 		api.GET("/media", guardByLibraryQuery, handlers.Media.List)
 		api.GET("/media/:id", guardByMediaID, handlers.Media.Detail)
 		api.GET("/media/:id/enhanced", guardByMediaID, handlers.Media.DetailEnhanced)
+		api.GET("/media/:id/versions", guardByMediaID, handlers.Media.Versions)
 		api.GET("/media/recent", handlers.Media.Recent)
 		api.GET("/media/recent/aggregated", handlers.Media.RecentAggregated)
 		api.GET("/media/recent/mixed", handlers.Media.RecentMixed)
@@ -598,6 +599,10 @@ func main() {
 		admin.GET("/ai/errors", handlers.AI.GetAIErrorLogs)
 		admin.POST("/ai/test/search", handlers.AI.TestSmartSearch)
 		admin.POST("/ai/test/recommend", handlers.AI.TestRecommendReason)
+		// AI 模型选择 / 成本估算（懒人入库 & 配置面板使用）
+		admin.GET("/ai/models", handlers.AICost.ListModels)
+		admin.GET("/ai/cost/estimate", handlers.AICost.Estimate)
+		admin.GET("/ai/cost/summary", handlers.AICost.Summary)
 
 		// 用户观影统计（管理员）
 		admin.GET("/stats/:userId", handlers.Stats.GetUserStatsAdmin)
@@ -621,6 +626,15 @@ func main() {
 		admin.GET("/scan-classify/:mediaId", handlers.ScanPostProcess.Get)
 		admin.POST("/scan-classify/reprocess", handlers.ScanPostProcess.Reprocess)
 		admin.DELETE("/scan-classify", handlers.ScanPostProcess.Clear)
+
+		// ==================== 懒人入库（一键入库） ====================
+		// 用户只给 source_path，系统自动完成：扫描 → AI 分类 → 命名 → 落盘 → 建库 → 扫描。
+		// 默认 hardlink 优先（同卷瞬时、跨卷自动 copy）；不删除源文件；目标已存在则跳过。
+		admin.POST("/ingest/submit", handlers.LazyIngest.Submit)
+		admin.GET("/ingest/jobs", handlers.LazyIngest.ListJobs)
+		admin.GET("/ingest/jobs/:id", handlers.LazyIngest.GetJob)
+		admin.GET("/ingest/jobs/:id/items", handlers.LazyIngest.GetJobItems)
+		admin.POST("/ingest/jobs/:id/cancel", handlers.LazyIngest.CancelJob)
 
 		// ==================== 番号刮削管理 ====================
 		admin.GET("/adult-scraper/config", handlers.AdultScraper.GetConfig)
@@ -947,6 +961,11 @@ func main() {
 
 	// 停止 mDNS 服务发现
 	mdnsService.Stop()
+
+	// 停止扫描后处理 worker（避免正在 AI 识别 / DB 写入时被中断造成数据不一致）
+	if services != nil && services.ScanPostProcess != nil {
+		services.ScanPostProcess.Stop()
+	}
 
 	// 停止 Python 番号刮削微服务子进程
 	pythonLauncher.Stop()

@@ -6,8 +6,10 @@ import {
   Loader2, ExternalLink, Shield, Code, Palette, Music, Bell,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useDialog } from '@/components/Dialog'
 
 export default function PluginManager() {
+  const dialog = useDialog()
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [scanning, setScanning] = useState(false)
@@ -54,7 +56,13 @@ export default function PluginManager() {
   }
 
   const handleUninstall = async (id: string) => {
-    if (!confirm('确定要卸载此插件吗？')) return
+    const ok = await dialog.confirm({
+      title: '卸载插件',
+      message: '确定要卸载此插件吗？',
+      confirmText: '卸载',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       await pluginApi.uninstall(id)
       setMessage({ type: 'success', text: '插件已卸载' })
