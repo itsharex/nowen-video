@@ -1159,3 +1159,111 @@ html[data-runtime="tauri"] #root {
   border-color: var(--border-hover) !important;
   box-shadow: 0 0 0 1px var(--focus-ring);
 }
+
+/* ==================== 日间模式语义色矫正 ====================
+   背景：项目里大量组件直接用 Tailwind 暗色调
+   （如 text-emerald-300 / text-amber-300 / text-sky-300 / bg-*-500/10）。
+   这些值在 #0b1120 暗底上对比度足够，但在 #f0f2f5 白底上会"曝光"
+   —— 浅色文字+极浅底糊在一起，提示完全看不清（见扫描归类页 Banner）。
+
+   策略：仅在 [data-theme="light"] 下，把这些常用类名重新映射到
+   "深色文字 + 中等饱和底"组合，**不改任何 tsx**，全站受益。
+*/
+[data-theme="light"] {
+  /* —— 文字色：从浅色调到深色调 —— */
+  /* emerald 翠绿系 → 用于"完成/成功" */
+  --light-text-emerald-200: #047857;
+  --light-text-emerald-300: #047857;
+  --light-text-emerald-400: #047857;
+
+  /* amber 琥珀系 → 用于"待修正/警告" */
+  --light-text-amber-200: #b45309;
+  --light-text-amber-300: #b45309;
+  --light-text-amber-400: #b45309;
+
+  /* sky 天蓝系 → 用于信息提示 / Movies 徽章 */
+  --light-text-sky-200: #0369a1;
+  --light-text-sky-300: #0369a1;
+  --light-text-sky-400: #0369a1;
+
+  /* violet 紫色系 → TV Shows 徽章 */
+  --light-text-violet-200: #6d28d9;
+  --light-text-violet-300: #6d28d9;
+
+  /* pink 粉色系 → Music 徽章 */
+  --light-text-pink-200: #be185d;
+  --light-text-pink-300: #be185d;
+
+  /* zinc / red */
+  --light-text-zinc-300: #475569;
+  --light-text-red-200: #b91c1c;
+  --light-text-red-300: #b91c1c;
+  --light-text-blue-200: #1d4ed8;
+  --light-text-blue-300: #1d4ed8;
+
+  /* —— 底色：从极浅(/10)抬到中浅(/15~/20) + 加 1px 边框感 —— */
+  --light-bg-emerald-10: rgba(16, 185, 129, 0.14);
+  --light-bg-emerald-15: rgba(16, 185, 129, 0.18);
+  --light-bg-amber-10: rgba(245, 158, 11, 0.16);
+  --light-bg-amber-15: rgba(245, 158, 11, 0.22);
+  --light-bg-sky-10: rgba(14, 165, 233, 0.14);
+  --light-bg-sky-15: rgba(14, 165, 233, 0.18);
+  --light-bg-violet-10: rgba(139, 92, 246, 0.14);
+  --light-bg-violet-15: rgba(139, 92, 246, 0.18);
+  --light-bg-pink-10: rgba(236, 72, 153, 0.14);
+  --light-bg-pink-15: rgba(236, 72, 153, 0.18);
+  --light-bg-blue-10: rgba(59, 130, 246, 0.14);
+  --light-bg-red-10: rgba(239, 68, 68, 0.14);
+}
+
+/* —— Tailwind class 覆盖（仅日间模式） —— */
+[data-theme="light"] .text-emerald-200 { color: var(--light-text-emerald-200) !important; }
+[data-theme="light"] .text-emerald-300 { color: var(--light-text-emerald-300) !important; }
+[data-theme="light"] .text-emerald-400 { color: var(--light-text-emerald-400) !important; }
+[data-theme="light"] .text-amber-200   { color: var(--light-text-amber-200) !important; }
+[data-theme="light"] .text-amber-300   { color: var(--light-text-amber-300) !important; }
+[data-theme="light"] .text-amber-400   { color: var(--light-text-amber-400) !important; }
+[data-theme="light"] .text-sky-200     { color: var(--light-text-sky-200) !important; }
+[data-theme="light"] .text-sky-300     { color: var(--light-text-sky-300) !important; }
+[data-theme="light"] .text-sky-400     { color: var(--light-text-sky-400) !important; }
+[data-theme="light"] .text-violet-200  { color: var(--light-text-violet-200) !important; }
+[data-theme="light"] .text-violet-300  { color: var(--light-text-violet-300) !important; }
+[data-theme="light"] .text-pink-200    { color: var(--light-text-pink-200) !important; }
+[data-theme="light"] .text-pink-300    { color: var(--light-text-pink-300) !important; }
+[data-theme="light"] .text-zinc-300    { color: var(--light-text-zinc-300) !important; }
+[data-theme="light"] .text-red-200     { color: var(--light-text-red-200) !important; }
+[data-theme="light"] .text-red-300     { color: var(--light-text-red-300) !important; }
+[data-theme="light"] .text-blue-200    { color: var(--light-text-blue-200) !important; }
+[data-theme="light"] .text-blue-300    { color: var(--light-text-blue-300) !important; }
+
+/* 半透明小字也提色（如 text-amber-300/80） */
+[data-theme="light"] .text-amber-300\/80 { color: var(--light-text-amber-200) !important; opacity: 0.92; }
+[data-theme="light"] .text-emerald-300\/80 { color: var(--light-text-emerald-200) !important; opacity: 0.92; }
+
+/* 背景色提色（让浅色提示框在白底上更显眼） */
+[data-theme="light"] .bg-emerald-500\/10 { background-color: var(--light-bg-emerald-10) !important; }
+[data-theme="light"] .bg-emerald-500\/15 { background-color: var(--light-bg-emerald-15) !important; }
+[data-theme="light"] .bg-amber-500\/10   { background-color: var(--light-bg-amber-10) !important; }
+[data-theme="light"] .bg-amber-500\/15   { background-color: var(--light-bg-amber-15) !important; }
+[data-theme="light"] .bg-sky-500\/10     { background-color: var(--light-bg-sky-10) !important; }
+[data-theme="light"] .bg-sky-500\/15     { background-color: var(--light-bg-sky-15) !important; }
+[data-theme="light"] .bg-violet-500\/10  { background-color: var(--light-bg-violet-10) !important; }
+[data-theme="light"] .bg-violet-500\/15  { background-color: var(--light-bg-violet-15) !important; }
+[data-theme="light"] .bg-pink-500\/10    { background-color: var(--light-bg-pink-10) !important; }
+[data-theme="light"] .bg-pink-500\/15    { background-color: var(--light-bg-pink-15) !important; }
+[data-theme="light"] .bg-blue-500\/10    { background-color: var(--light-bg-blue-10) !important; }
+[data-theme="light"] .bg-red-500\/10     { background-color: var(--light-bg-red-10) !important; }
+
+/* 边框色统一加深一档，提升白底辨识度 */
+[data-theme="light"] .border-emerald-500\/30 { border-color: rgba(4, 120, 87, 0.45) !important; }
+[data-theme="light"] .border-amber-500\/30   { border-color: rgba(180, 83, 9, 0.45) !important; }
+[data-theme="light"] .border-sky-500\/30     { border-color: rgba(3, 105, 161, 0.45) !important; }
+[data-theme="light"] .border-violet-500\/30  { border-color: rgba(109, 40, 217, 0.45) !important; }
+[data-theme="light"] .border-pink-500\/30    { border-color: rgba(190, 24, 93, 0.45) !important; }
+
+/* surface-* 文字在日间已在 Tailwind surface 色板里翻转过；
+   但 text-surface-300/400/500（业务里"次要文字"）在白底上偶尔太浅，
+   补一档保底加深 */
+[data-theme="light"] .text-surface-300 { color: #475569 !important; }
+[data-theme="light"] .text-surface-400 { color: #475569 !important; }
+[data-theme="light"] .text-surface-500 { color: #64748b !important; }
