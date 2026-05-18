@@ -28,9 +28,11 @@ import {
   Keyboard,
   Zap,
   ChevronDown,
+  Wand2,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useDialog } from '@/components/Dialog'
+import SmartRenameDrawer from '@/components/SmartRenameDrawer'
 
 // ==================== 智能归类（原"扫描后处理 / 虚拟归类与命名映射"） ====================
 //
@@ -139,6 +141,10 @@ export default function ClassificationTab() {
   const [tourSeen, setTourSeen] = useState<boolean>(() => {
     return localStorage.getItem('classify-tour-seen') === '1'
   })
+
+  // 专家动作：应用建议名称到磁盘（智能重命名抽屉）
+  // Phase 2：将原独立入口收敛到扫描归类专家模式
+  const [renameDrawerOpen, setRenameDrawerOpen] = useState(false)
 
   // 当前用户在搜索框内
   const searchRef = useRef<HTMLInputElement | null>(null)
@@ -512,6 +518,44 @@ export default function ClassificationTab() {
           </div>
         </div>
 
+        {/* 专家区：应用建议名称到磁盘（专家模式 + AI 已配置 才显示） */}
+        {expertMode && aiReady && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm">
+            <div className="flex items-start gap-2 text-amber-100">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <div className="text-xs leading-relaxed">
+                <span className="font-semibold text-amber-200">危险区·应用建议名称到磁盘</span>
+                <span className="ml-2 text-amber-300/80">
+                  该动作会将识别出的「建议名称」真实重命名磁盘上的原始文件，仅推荐高级用户使用。
+                  需先选定具体媒体库，且动作可以回滚。
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                if (!libraryID) {
+                  setMessage({
+                    type: 'err',
+                    text: '请先选定具体媒体库后再使用「应用到磁盘」（不支持全库范围）',
+                  })
+                  return
+                }
+                setRenameDrawerOpen(true)
+              }}
+              className={clsx(
+                'flex shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition',
+                libraryID
+                  ? 'border border-amber-400/40 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25'
+                  : 'cursor-not-allowed border border-surface-700 bg-surface-900/60 text-surface-500',
+              )}
+              title={libraryID ? '打开智能重命名抽屉（需二级确认）' : '请先选定具体媒体库'}
+            >
+              <Wand2 className="h-3.5 w-3.5" />
+              ⚠️ 应用到磁盘
+            </button>
+          </div>
+        )}
+
         {/* AI 未配置黄条 */}
         {aiReady === false && (
           <div className="mt-3 flex items-center justify-between rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
@@ -785,6 +829,15 @@ export default function ClassificationTab() {
       {shortcutHelpOpen && (
         <ShortcutHelpModal onClose={() => setShortcutHelpOpen(false)} />
       )}
+
+      {/* 智能重命名抽屉（Phase 2）— 仅专家模式下从本面板调出 */}
+      <SmartRenameDrawer
+        open={renameDrawerOpen}
+        library={
+          libraryID ? libraries.find((l) => l.id === libraryID) || null : null
+        }
+        onClose={() => setRenameDrawerOpen(false)}
+      />
     </div>
   )
 }
