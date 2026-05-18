@@ -824,6 +824,9 @@ func primaryGenre(genreTags string) string {
 
 // naming 生成 Jellyfin/Emby 风格的建议命名 / 子目录 / 完整路径。
 // 全程仅写入 classification 字段，不动磁盘。
+//
+// 命名规则与一键入库（LazyIngest）/ 智能重命名（SmartRename）三处统一，
+// 全部委托 BuildStandardNames 渲染（含季号兜底、季尾缀剥离、目录名带 idtag 等修正）。
 func (s *ScanPostProcessService) naming(media *model.Media, parsed scanPostParsed, c *model.MediaClassification) {
 	style := strings.ToLower(strings.TrimSpace(c.NamingStyle))
 	if style != NamingStyleJellyfin && style != NamingStylePlex {
@@ -831,44 +834,48 @@ func (s *ScanPostProcessService) naming(media *model.Media, parsed scanPostParse
 	}
 	c.NamingStyle = style
 
-	ext := strings.ToLower(filepath.Ext(media.FilePath))
-	title := sanitizeTitle(parsed.Title) // 复用 smart_rename.go 同包函数
-	if title == "" {
-		title = sanitizeTitle(strings.TrimSuffix(filepath.Base(media.FilePath), ext))
+	// 路径 ID 兜底：源路径目录上有 [tmdbid-X] 时回收
+	tmdbID := parsed.TMDbID
+	imdbID := parsed.IMDbID
+	if tmdbID == 0 || imdbID == "" {
+		t, i := ExtractIDsFromPath(media.FilePath)
+		if tmdbID == 0 && t > 0 {
+			tmdbID = t
+		}
+		if imdbID == "" && i != "" {
+			imdbID = i
+		}
 	}
 
-	var suggestedName, suggestedDir string
+	mediaType := "movie"
 	if isEpisode(media, parsed) {
-		// 剧集：Title (Year) S01E02 [tmdbid-xxx].ext
-		base := fmt.Sprintf("%s S%02dE%02d", title, parsed.Season, parsed.Episode)
-		if parsed.Year > 0 {
-			base = fmt.Sprintf("%s (%d) S%02dE%02d", title, parsed.Year, parsed.Season, parsed.Episode)
-		}
-		base += renderIDTag(style, parsed.TMDbID, parsed.IMDbID)
-		suggestedName = collapseWhitespace(base) + ext
+		mediaType = "episode"
+	}
 
-		// 子目录：Title (Year)/Season 01
-		seriesDir := title
-		if parsed.Year > 0 {
-			seriesDir = fmt.Sprintf("%s (%d)", title, parsed.Year)
+	names := BuildStandardNames(StandardNameInput{
+		SourcePath: media.FilePath,
+		SourceName: filepath.Base(media.FilePath),
+		MediaType:  mediaType,
+		Title:      parsed.Title,
+		Year:       parsed.Year,
+		TMDbID:     tmdbID,
+		IMDbID:     imdbID,
+		SeasonNum:  parsed.Season,
+		EpisodeNum: parsed.Episode,
+		Style:      style,
+	})
+
+	var suggestedName, suggestedDir string
+	if mediaType == "episode" {
+		suggestedName = names.FileName
+		// 集号未知 → FileName 为空时退化用 SourceName 占位（不影响目录建议）
+		if suggestedName == "" {
+			suggestedName = filepath.Base(media.FilePath)
 		}
-		seasonDir := fmt.Sprintf("Season %02d", parsed.Season)
-		suggestedDir = filepath.ToSlash(filepath.Join(seriesDir, seasonDir))
+		suggestedDir = filepath.ToSlash(filepath.Join(names.ShowFolder, names.SeasonDir))
 	} else {
-		// 电影：Title (Year) [tmdbid-xxx].ext
-		yearTag := ""
-		if parsed.Year > 0 {
-			yearTag = fmt.Sprintf(" (%d)", parsed.Year)
-		}
-		idTag := renderIDTag(style, parsed.TMDbID, parsed.IMDbID)
-		suggestedName = collapseWhitespace(title+yearTag+idTag) + ext
-
-		// 子目录：Title (Year)
-		movieDir := title
-		if parsed.Year > 0 {
-			movieDir = fmt.Sprintf("%s (%d)", title, parsed.Year)
-		}
-		suggestedDir = filepath.ToSlash(movieDir)
+		suggestedName = names.FileName
+		suggestedDir = filepath.ToSlash(names.MovieFolder)
 	}
 
 	c.SuggestedName = suggestedName

@@ -670,9 +670,7 @@ func (s *LazyIngestService) resolveDestPath(targetRoot string, item *model.Renam
 
 // deriveShowFolderName 从 RenamePlanItem 中派生 TV Show 文件夹名
 //
-// 优先用 ParsedTitle [+ Year] [+ tmdbid]；否则退化到去掉 SxxExx 的源文件名。
-// 注意：会调用 NormalizeSeriesTitle 剥离"第二季 / Season 2 / S2"等尾缀，
-// 确保同一系列的不同季号合并到一个剧集目录下，便于后续刮削归并。
+// 内部委托 BuildStandardNames，与一键入库/智能重命名/扫描归类三处保持一致。
 func (s *LazyIngestService) deriveShowFolderName(item *model.RenamePlanItem) string {
 	title := strings.TrimSpace(item.ParsedTitle)
 	if title == "" {
@@ -685,22 +683,22 @@ func (s *LazyIngestService) deriveShowFolderName(item *model.RenamePlanItem) str
 			title = stem
 		}
 	}
-	// 关键：剥离"第二季/Season 2/S2"等季号尾缀（避免每季产生独立目录）
-	if cleaned := NormalizeSeriesTitle(title); cleaned != "" {
-		title = cleaned
+	names := BuildStandardNames(StandardNameInput{
+		SourcePath: item.SourcePath,
+		SourceName: item.SourceName,
+		MediaType:  "episode",
+		Title:      title,
+		Year:       item.ParsedYear,
+		TMDbID:     item.ParsedTMDbID,
+		IMDbID:     item.ParsedIMDbID,
+		SeasonNum:  item.SeasonNum,
+		EpisodeNum: item.EpisodeNum,
+		Style:      NamingStyleJellyfin,
+	})
+	if names.ShowFolder != "" {
+		return names.ShowFolder
 	}
-	title = sanitizeTitle(title)
-
-	folder := title
-	if item.ParsedYear > 0 {
-		folder = fmt.Sprintf("%s (%d)", title, item.ParsedYear)
-	}
-	if item.ParsedTMDbID > 0 {
-		folder += fmt.Sprintf(" [tmdbid-%d]", item.ParsedTMDbID)
-	} else if item.ParsedIMDbID != "" {
-		folder += fmt.Sprintf(" [imdbid-%s]", item.ParsedIMDbID)
-	}
-	return collapseWhitespace(folder)
+	return collapseWhitespace(title)
 }
 
 // ==================== 建库 ====================

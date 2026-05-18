@@ -574,6 +574,22 @@ func (s *SmartRenameService) buildItem(
 		}
 	}
 
+	// === P0.5: 路径 ID 兜底 ===
+	// 当文件名/解析结果中没有 tmdbid 但源路径目录上挂着 [tmdbid-X] 时，回收之。
+	// 用例："逃学威龙2/逃学威龙2.mkv" 上层有 "逃学威龙 (1991) [tmdbid-10258]" 时回收 ID。
+	if parsed.TMDbID == 0 || parsed.IMDbID == "" {
+		tmdbFromPath, imdbFromPath := ExtractIDsFromPath(src)
+		if parsed.TMDbID == 0 && tmdbFromPath > 0 {
+			parsed.TMDbID = tmdbFromPath
+			if conf < 0.9 {
+				conf = 0.9 // 路径上有精确 ID，置信度抬升
+			}
+		}
+		if parsed.IMDbID == "" && imdbFromPath != "" {
+			parsed.IMDbID = imdbFromPath
+		}
+	}
+
 	item.ParsedTitle = parsed.Title
 	item.ParsedTitleAlt = parsed.TitleAlt
 	item.ParsedYear = parsed.Year
@@ -1147,61 +1163,42 @@ func stripJSONFence(s string) string {
 // ================================ P2: 命名模板 ===============================
 
 // renderTargetName 渲染目标文件名（不带目录）
+//
+// 内部委托共享渲染器 BuildStandardNames，确保规则与一键入库 / 扫描归类一致。
+// 关键修正：
+//   - 剧集场景下季号兜底（SeasonNum<=0 → 1）
+//   - 剧集场景下季尾缀剥离（"一拳超人 第二季" → "一拳超人"）
+//   - 当集号未知时返回错误（让上层归入 _unsorted）
 func (s *SmartRenameService) renderTargetName(style, customTpl string, p ParsedFilename, item *model.RenamePlanItem) (string, error) {
-	ext := filepath.Ext(item.SourceName)
-	// 标题清洗：去掉 NTFS 禁止字符 + 折叠空白
-	title := sanitizeTitle(p.Title)
-	if title == "" {
-		title = sanitizeTitle(strings.TrimSuffix(item.SourceName, ext))
+	names := BuildStandardNames(StandardNameInput{
+		SourcePath: item.SourcePath,
+		SourceName: item.SourceName,
+		MediaType:  item.MediaType,
+		Title:      p.Title,
+		Year:       p.Year,
+		TMDbID:     p.TMDbID,
+		IMDbID:     p.IMDbID,
+		SeasonNum:  item.SeasonNum,
+		EpisodeNum: item.EpisodeNum,
+		Style:      style,
+		CustomTpl:  customTpl,
+	})
+
+	// 同步回 item：剧集季尾缀剥离 / 季号兜底的结果反写，避免后续 deriveShowFolderName 再走一遍
+	if strings.EqualFold(item.MediaType, "episode") {
+		if names.EffectiveTitle != "" && names.EffectiveTitle != p.Title {
+			item.ParsedTitle = names.EffectiveTitle
+		}
+		if names.EffectiveSeasonNum > 0 && item.SeasonNum != names.EffectiveSeasonNum {
+			item.SeasonNum = names.EffectiveSeasonNum
+		}
 	}
 
-	// 剧集格式：Title S01E02.ext（Jellyfin/Plex 等都识别）
-	if item.MediaType == "episode" && item.SeasonNum > 0 && item.EpisodeNum > 0 {
-		base := fmt.Sprintf("%s S%02dE%02d", title, item.SeasonNum, item.EpisodeNum)
-		if p.Year > 0 {
-			base = fmt.Sprintf("%s (%d) S%02dE%02d", title, p.Year, item.SeasonNum, item.EpisodeNum)
-		}
-		// ID 标签
-		base += renderIDTag(style, p.TMDbID, p.IMDbID)
-		return base + strings.ToLower(ext), nil
+	if names.FileName == "" {
+		return "", fmt.Errorf("无法渲染目标文件名（mediaType=%s season=%d episode=%d title=%q）",
+			item.MediaType, item.SeasonNum, item.EpisodeNum, p.Title)
 	}
-
-	// 电影格式
-	year := ""
-	if p.Year > 0 {
-		year = fmt.Sprintf(" (%d)", p.Year)
-	}
-
-	// 优先采用用户自定义模板（支持占位符 {title}/{year}/{tmdb}/{imdb}/{ext}）
-	if strings.TrimSpace(customTpl) != "" {
-		out := customTpl
-		out = strings.ReplaceAll(out, "{title}", title)
-		if p.Year > 0 {
-			out = strings.ReplaceAll(out, "{year}", strconv.Itoa(p.Year))
-			out = strings.ReplaceAll(out, "({year})", fmt.Sprintf("(%d)", p.Year))
-		} else {
-			out = strings.ReplaceAll(out, "{year}", "")
-			out = strings.ReplaceAll(out, "({year})", "")
-		}
-		if p.TMDbID > 0 {
-			out = strings.ReplaceAll(out, "{tmdb}", strconv.Itoa(p.TMDbID))
-		} else {
-			out = strings.ReplaceAll(out, "{tmdb}", "")
-		}
-		out = strings.ReplaceAll(out, "{imdb}", p.IMDbID)
-		out = strings.ReplaceAll(out, "{ext}", strings.TrimPrefix(strings.ToLower(ext), "."))
-		// 折叠多余空白
-		out = collapseWhitespace(out)
-		// 如果模板没指定扩展名，自动补
-		if !strings.HasSuffix(strings.ToLower(out), strings.ToLower(ext)) {
-			out += strings.ToLower(ext)
-		}
-		return out, nil
-	}
-
-	base := fmt.Sprintf("%s%s%s", title, year, renderIDTag(style, p.TMDbID, p.IMDbID))
-	base = collapseWhitespace(base)
-	return base + strings.ToLower(ext), nil
+	return names.FileName, nil
 }
 
 // renderIDTag 按风格生成 ID 标签
